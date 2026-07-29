@@ -1,0 +1,41 @@
+schema_version = "1.0.0"
+
+# Blender 5.2 LTS uses the extensions platform: this manifest replaces the
+# legacy `bl_info` dict (which changed in 4.2 and is deprecated -- see
+# BLENDER_ADDON_PLAN.md constraint B8, verified against the 5.2 manual).
+# There is deliberately no bl_info in __init__.py: Blender rewrites and then
+# strips bl_info on "Reload Scripts" when a manifest is present, so keeping
+# both is a source of confusing drift. This addon targets 5.2+ only.
+
+id = "so100_builder"
+version = "0.1.0"
+name = "SO-100 Stick Builder"
+tagline = "Slice a wireframe mesh into a robot-buildable stick sculpture"
+maintainer = "MagnaRecta <tono_war@hotmail.com>"
+type = "add-on"
+
+blender_version_min = "5.2.0"
+
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
+
+tags = ["Object", "Mesh", "Import-Export"]
+
+# No [permissions] block on purpose.
+#   network   -- not needed: there is NO live connection to ROS2 (Option C,
+#                BLENDER_ADDON_PLAN.md Sec 2). The build file is the only
+#                integration surface.
+#   files     -- the export operators use Blender's own ExportHelper file
+#                browser, which does not require the `files` permission.
+# No `wheels` either: stdlib + bpy/mathutils/gpu only (constraint B4), and
+# specifically no numpy anywhere (the vendored kinematics module must run in
+# Blender's bundled interpreter on both Linux and Windows).
+
+[build]
+paths_exclude_pattern = [
+  "__pycache__/",
+  "/.git/",
+  "/*.zip",
+  "/tests/",
+]
