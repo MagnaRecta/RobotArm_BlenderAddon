@@ -1,5 +1,5 @@
-"""GPU viewport overlay: build volume + per-stick status colours.
-BLENDER_ADDON_PLAN.md Sec 10.4.
+"""GPU viewport overlay: build volume, robot base box, and per-stick status
+colours. BLENDER_ADDON_PLAN.md Sec 10.4.
 
 Kept in its own module with a hard on/off switch (``scene.so100.show_overlay``)
 per Sec 10.4's explicit warning: *"draw handlers are the most common cause of
@@ -34,13 +34,14 @@ import bpy
 import gpu
 from gpu_extras.batch import batch_for_shader
 
+from ..core import robots as core_robots
 from ..core import state as core_state
 from ..core import transform as core_transform
-from ..kinematics.constants import BUILD_VOLUME_MAX_M, BUILD_VOLUME_MIN_M
 
 _handle = None
 
 _VOLUME_COLOR = (0.7, 0.7, 0.75, 0.6)
+_BASE_BOX_COLOR = (0.6, 0.45, 0.3, 0.6)
 
 _STATUS_COLOR = {
     core_state.STATUS_PENDING: (0.55, 0.55, 0.55, 1.0),
@@ -59,8 +60,9 @@ _VOLUME_EDGES = (
 )
 
 
-def _volume_box_points(base_matrix_world, scale_length):
-    lo, hi = BUILD_VOLUME_MIN_M, BUILD_VOLUME_MAX_M
+def _box_edge_points(lo, hi, base_matrix_world, scale_length):
+    """12-edge wireframe line list for an axis-aligned box given in the
+    robot's own frame, transformed into Blender world space."""
     corners_local = (
         (lo[0], lo[1], lo[2]), (hi[0], lo[1], lo[2]), (hi[0], hi[1], lo[2]), (lo[0], hi[1], lo[2]),
         (lo[0], lo[1], hi[2]), (hi[0], lo[1], hi[2]), (hi[0], hi[1], hi[2]), (lo[0], hi[1], hi[2]),
@@ -74,6 +76,36 @@ def _volume_box_points(base_matrix_world, scale_length):
         points.append(corners[a])
         points.append(corners[b])
     return points
+
+
+def _volume_box_points(base_matrix_world, scale_length, robot_id):
+    """The selected robot's own build volume (``core/robots.py``'s
+    ``RobotProfile``), multi-robot support (docs/STATUS.md 2026-08-21) --
+    previously always drew so_arm_100's box regardless of ``robot_id``.
+    Returns ``[]`` (drawing nothing, not a crash or a made-up box) for a
+    robot with no confirmed build volume yet -- neither registered robot
+    hits that today, but a future one might before it earns real numbers.
+    """
+    profile = core_robots.get_robot(robot_id)
+    if not profile.has_build_volume:
+        return []
+    return _box_edge_points(
+        profile.build_volume_min_m, profile.build_volume_max_m,
+        base_matrix_world, scale_length)
+
+
+def _base_box_points(base_matrix_world, scale_length, robot_id):
+    """The selected robot's own mounting pedestal (``RobotProfile.
+    base_box_min_m/max_m``), 2026-08-23 user request -- a viewport
+    reference only, drawn for whichever robot has one (kr10_r900_2 today;
+    so_arm_100 has none, same ``[]``-means-"don't draw" convention as
+    ``_volume_box_points`` above)."""
+    profile = core_robots.get_robot(robot_id)
+    if not profile.has_base_box:
+        return []
+    return _box_edge_points(
+        profile.base_box_min_m, profile.base_box_max_m,
+        base_matrix_world, scale_length)
 
 
 def _stick_status_points_and_colors(props):
@@ -109,11 +141,18 @@ def _draw():
     if props.base_empty is not None and props.base_empty.name in bpy.data.objects:
         base_matrix = core_transform.to_tuple_4x4(props.base_empty.matrix_world)
         scale_length = scene.unit_settings.scale_length
-        volume_points = _volume_box_points(base_matrix, scale_length)
+        shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+
+        volume_points = _volume_box_points(base_matrix, scale_length, props.robot_id)
         if volume_points:
-            shader = gpu.shader.from_builtin("UNIFORM_COLOR")
             batch = batch_for_shader(shader, "LINES", {"pos": volume_points})
             shader.uniform_float("color", _VOLUME_COLOR)
+            batch.draw(shader)
+
+        base_box_points = _base_box_points(base_matrix, scale_length, props.robot_id)
+        if base_box_points:
+            batch = batch_for_shader(shader, "LINES", {"pos": base_box_points})
+            shader.uniform_float("color", _BASE_BOX_COLOR)
             batch.draw(shader)
 
     stick_points, stick_colors = _stick_status_points_and_colors(props)

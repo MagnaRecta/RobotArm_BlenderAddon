@@ -5,7 +5,10 @@ into a validated, ordered build file that a separate ROS2 process executes.
 There is deliberately **no live connection** to ROS2 (Option C,
 `docs/BLENDER_ADDON_PLAN.md` §2) — the build file is the entire interface.
 
-**Status: Phases A–D complete.** Phase E is not started.
+**Status: Phases A–E complete, plus multi-robot registry support (2026-08-22,
+see `docs/BLENDER_ADDON_PLAN.md` §4a).** Phase D's hardware run (building on
+the real robot) is the one thing that cannot be automated here — see "What
+Phase D delivers" below.
 
 ---
 
@@ -15,11 +18,11 @@ There is deliberately **no live connection** to ROS2 (Option C,
 # In Blender (runs everything, including the bpy integration tests)
 /opt/blender/blender --background --python so100_builder/tests/run.py
 
-# Bare CPython (skips the 69 bpy tests; proves core/ and kinematics/ are pure)
+# Bare CPython (skips the ~80 bpy tests; proves core/ and kinematics/ are pure)
 python3 so100_builder/tests/run.py
 ```
 
-Both must pass. 278 tests; the bare-CPython run is what catches a `bpy`
+Both must pass. 370 tests; the bare-CPython run is what catches a `bpy`
 import leaking into `core/` or `kinematics/`.
 
 ## Installing
@@ -76,17 +79,31 @@ hardcoded as a test fixture.
 Nothing load-bearing has been built on these, but they are read from the
 kinematics module and will propagate if they are wrong.
 
-1. **`GRASP_OFFSET_M = 0.051` is derived from FK, not measured.** It sets the
-   66 mm hard floor on stick length via `hard_min_stick_length_m()`. The addon
-   reads it from `kinematics/constants.py` and never hardcodes it, so a Phase 0
-   ruler correction propagates automatically — re-run the tests, since
-   `test_hard_floor_comes_from_the_kinematics_module` asserts the 66 mm value.
+1. **`GRASP_OFFSET_M = 0.051` is derived from FK, not measured.** D13
+   (`grasp.grasp_offset_for_length()`, kinematics v1.3.0) made the grip
+   offset adaptive per stick, but `GRASP_OFFSET_M` remains the ceiling every
+   long-enough stick still gets. The addon reads it from
+   `kinematics/so_arm_100/constants.py` and never hardcodes it, so a Phase 0
+   ruler correction propagates automatically.
 2. **The `stick_roll` → `Wrist_Roll` sign convention is untested on hardware.**
    Phase A emits `roll_deg = 0.0` for every stick, so nothing here depends on
    it yet. It becomes load-bearing in Phase B/D.
-3. **`JAW_MARGIN_M = 0.015`** is back-derived from the plan's quoted ~66 mm
-   floor minus the 51 mm grip height. Phase 0 measures the jaw envelope
-   directly.
+3. **`MIN_GRASP_OFFSET_M = 0.030` is an unmeasured placeholder**, same status
+   as `GRASP_OFFSET_M` above. Together with `JAW_CONTACT_HALF_LENGTH_M`
+   (5mm, confirmed by the user's own jaw measurement) it sets the 35 mm hard
+   floor on stick length via `hard_min_stick_length_m()`. The addon reads
+   both from `kinematics/so_arm_100/constants.py` and never hardcodes them,
+   so a Phase 0 correction propagates automatically — re-run the tests,
+   since `test_hard_floor_comes_from_the_kinematics_module` asserts the
+   35 mm value. Phase 0 measures the jaw envelope directly.
+4. **These, and everything else in this section, are so_arm_100-specific.**
+   `kr10_r900_2_kinematics` (vendored 2026-08-22) has its own real
+   caveats of the same shape — round-2mm-stock `GRASP_OFFSET_M`/`JAW_RADIUS_M`
+   estimates, an unconfirmed `MIN_GRASP_OFFSET_M` — documented in *its own*
+   package (see `kinematics/kr10_r900_2/constants.py`'s own comments), not
+   repeated here. `core/sticks.py`'s mesh-expansion geometry does not read
+   any of them yet regardless of `robot_id` — see
+   `docs/BLENDER_ADDON_PLAN.md` §4a's closing note.
 
 ---
 
@@ -220,12 +237,17 @@ stick directions (not restricted to any plane) found 383 reachable
 placements, every one verified to <0.001° error. That table entry in both
 planning docs should be corrected; `core/validate.py` does not encode it.
 
-### The grasp-orientation transform — built here, unbuilt on the ROS2 side
+### The grasp-orientation transform — now shared with the ROS2 side
 
 Converting a stick's 3D direction into `chain.ik()`'s
-`(tool_elevation_rad, stick_roll_rad)` pair is genuinely non-trivial and is
-explicitly **not yet written on the ROS2 side either** (its own Phase 1
-checklist says so). `core/validate.py` builds it from facts `chain.py`
+`(tool_elevation_rad, stick_roll_rad)` pair is genuinely non-trivial. It was
+first built in `core/validate.py`, then **promoted into
+`so_arm_100_kinematics.grasp` (v1.1.0)** so the ROS2 side's `PlaceStick`
+action uses the exact same, self-verifying search — closing the integration
+gap this section used to flag (see "An integration gap worth flagging
+before hardware" below, now resolved). `core/validate.py` calls
+`kinematics.grasp.solve_stick_orientation` / `grasp_target` rather than
+deriving orientations itself; it built the transform from facts `chain.py`
 already states and tests — planarity, perpendicularity, `Wrist_Roll`
 TCP-invariance — not from anything new about the arm. Four findings from
 building it, all confirmed empirically against `fk()`/`ik()`, not assumed:
@@ -264,8 +286,8 @@ building it, all confirmed empirically against `fk()`/`ik()`, not assumed:
 
 **Every accepted candidate is verified by feeding the solved joints back
 through `fk()` and checking the achieved direction against the target**
-(0.05° for the exact roots, `_ANCHOR_TOLERANCE_DEG` for the cardinal
-fallback — see below) — never trusted from the formula alone. Because the
+(0.05° for the exact roots, `kinematics.grasp.ANCHOR_TOLERANCE_DEG` for the
+cardinal fallback — see below) — never trusted from the formula alone. Because the
 search is exhaustive over both families and self-verifying, "no candidate
 verifies" means the placement is genuinely unreachable, not merely
 unvalidated.
@@ -283,7 +305,7 @@ chase. That made the tolerance itself worth grounding in something
 physical instead of another reactive bump: the joint's own glue gap
 (3.25–6.5 mm) already absorbs `asin(3.25/110)..asin(6.5/110) ≈ 1.7°–3.4°`
 of angular slack over a ~110 mm stick before the gap itself is exceeded.
-`_ANCHOR_TOLERANCE_DEG = 5.0` sits comfortably above that (covers the
+`kinematics.grasp.ANCHOR_TOLERANCE_DEG = 5.0` sits comfortably above that (covers the
 2.08° case with margin) while staying far below where every actual
 wrong-branch bug found this session showed up (15–180°, never single
 digits). A stick accepted via this fallback — an approximation, not an
@@ -309,7 +331,7 @@ angle_from_tangential)`) and warn only when neither is within
 `OUT_OF_PLANE_WARN_THRESHOLD_RAD` — so a purely vertical, radial,
 tangential, or in-plane-tilted stick never warns, and only a real oblique
 lean does. That threshold is now deliberately the *same* value as
-`_ANCHOR_TOLERANCE_DEG` (5°), not a coincidence: the 2.077° case above
+`kinematics.grasp.ANCHOR_TOLERANCE_DEG` (5°), not a coincidence: the 2.077° case above
 originally tripped both warnings for the same underlying cause (ordinary
 hand-drawn imprecision), which was redundant noise, not two distinct
 things worth flagging separately.
@@ -337,14 +359,14 @@ assignment.
 
 `core/sticks.py` already exposes a per-stick `flip` override for exactly
 this (Sec 5.1: *"Overridable per stick"*). `validate_stick` now checks it
-automatically on failure — re-running `_solve_orientation` with the negated
-axis — and if the flip would work, says so directly instead of a generic
-reach-based message: *"unreachable with this end as base ... but the
-OPPOSITE end works — toggle this stick's 'Flip' setting."* Verified both
-ways before shipping: confirmed the reported end is genuinely unreachable
-(all four cardinal anchors and both exact roots fail even at a 20° sanity
-tolerance, not merely `_ANCHOR_TOLERANCE_DEG`) and that flipping it actually
-builds.
+automatically on failure — re-running `kinematics.grasp.solve_stick_orientation`
+with the negated axis — and if the flip would work, says so directly instead
+of a generic reach-based message: *"unreachable with this end as base ...
+but the OPPOSITE end works — toggle this stick's 'Flip' setting."* Verified
+both ways before shipping: confirmed the reported end is genuinely
+unreachable (all four cardinal anchors and both exact roots fail even at a
+20° sanity tolerance, not merely `kinematics.grasp.ANCHOR_TOLERANCE_DEG`)
+and that flipping it actually builds.
 
 **Automated (2026-07-30, user-requested):** `Extract Sticks` now applies the
 suggested flip itself rather than leaving the user to notice the reason text
@@ -580,22 +602,109 @@ orientation DOF, which the stick's *direction* already consumes, so the spin
 is not independently commandable anyway. The wrist roll ROS2 actually needs
 is derived from `base`/`tip`, not read from this field.
 
-### ⚠ An integration gap worth flagging before hardware
+### The grasp-orientation integration gap — closed (2026-07-31)
 
 ROS2 re-validates the build file with the same kinematics module — that
-shared module is the entire basis for trusting Blender's verdicts. But
-turning `base`/`tip` into the `(tool_elevation_rad, stick_roll_rad)` pair
-`ik()` needs is **not** in that shared module: it lives in this addon's
-`core/validate.py` (`_solve_orientation`), and the ROS2 side's own Phase 1
-checklist still marks that transform "not written yet".
+shared module is the entire basis for trusting Blender's verdicts. Turning
+`base`/`tip` into the `(tool_elevation_rad, stick_roll_rad)` pair `ik()`
+needs used to live only in this addon's `core/validate.py`
+(`_solve_orientation`), with the ROS2 side's own Phase 1 checklist marking
+that transform "not written yet" — so the two sides shared the *kinematics*
+but not the *grasp orientation derivation*, and that derivation is where
+three sign/branch bugs were found during Phase B. An independent ROS2-side
+reimplementation would have been a realistic way for the two sides to
+disagree about where a stick goes — exactly the failure the shared-module
+design exists to prevent.
 
-So the two sides currently share the *kinematics* but not the *grasp
-orientation derivation* — and that derivation is where three sign/branch
-bugs were found during Phase B. If ROS2 re-derives it independently, the two
-sides can disagree about where a stick goes, which is exactly the failure the
-shared-module design exists to prevent.
+**Resolved:** the transform is now `so_arm_100_kinematics.grasp`
+(`grasp_target`, `azimuth_frame`, `solve_stick_orientation`, and a
+`solve_stick_placement` convenience for `PlaceStick`'s
+target→joints step), version 1.1.0, vendored verbatim into
+`so100_builder/kinematics/grasp.py`. `core/validate.py` now calls it instead
+of reimplementing it — see "The grasp-orientation transform" above. The
+ROS2-side `test/test_grasp.py` reuses the exact numeric regression cases
+found during Phase B debugging (the disputed out-of-plane tilt, the 0.71°
+and 2.077° near-degenerate elevation cases, the `Wrist_Roll` asymmetric-limit
+flip case), and is itself vendored into
+`so100_builder/tests/test_kinematics_grasp_vendored.py` so the addon-side
+copy is exercised the same way. **Still outstanding: updating the actual
+ROS2 workspace's `kinematics/` directory from this new 1.1.0 package** — that
+happens outside this repo.
 
-**Recommendation:** promote `_solve_orientation` (and
-`stick_grasp_target`) into `so_arm_100_kinematics` on the ROS2 side, bump its
-version, and re-vendor — rather than reimplementing it there. Not done here
-because the vendored copy must never be edited addon-side.
+---
+
+## What Phase E delivers
+
+The robot mirror rig (Sec 10.4, QB3): a preview-only rig posed by the shared
+FK, scrubbed through the build order — "watch the arm move to each
+placement before anything moves." No telemetry, no live robot link; Option C
+(Sec 2) never had either, and this preview needs neither.
+
+- `core/mirror.py` — `joint_frames(joint_angles_rad)`, pure Python, no
+  `bpy`. Returns the 6 points (`base_link` origin through the true TCP) a
+  rig needs to draw the 5-DOF chain as a stick figure.
+- `ops/mirror.py` — `SO100_OT_mirror_toggle` / `SO100_OT_mirror_step`, and
+  `update_mirror_rig()`, which poses a dedicated, always-non-selectable,
+  never-rendered mesh object (`SO100_Mirror`).
+- `ui/panels.py` — `SO100_PT_preview` (Sec 10.4's `Preview` panel, new):
+  show/hide toggle, prev/next through the build order, a status line.
+
+### `joint_frames()` is not a second FK implementation
+
+Getting the arm's *intermediate* joint positions (elbow, wrist, etc. — not
+just the final TCP) sounds like it needs its own forward-kinematics walk
+through `CHAIN`, which would mean re-deriving (and risking re-breaking) the
+same rotation-composition math `chain.py` already has, exactly the
+duplication the vendoring rules exist to prevent.
+
+It doesn't. `fk(joint_angles_rad)`'s own loop is
+`for (...), q in zip(CHAIN, joint_angles_rad)` — so calling it with a
+**shorter** prefix of the joint angles makes it stop exactly there, and the
+position/rotation it has accumulated at that point *is* the correct
+partial-chain frame, no reimplementation needed. The one wrinkle:
+`fk()`'s only postprocessing step, `pos += rot @ EE_OFFSET`, runs
+unconditionally after the loop — correct for the full 5-joint chain (that
+offset is real, the gripper's own reach past `Wrist_Roll`), wrong for a
+shorter prefix (there is no gripper yet at joint 2's frame). So
+`joint_frames()` calls `fk()` once per prefix length and subtracts that
+offset back out for every prefix but the last, using nothing but `fk()`'s
+own public output and the public `EE_OFFSET` constant.
+
+**Verified, not just argued**: every consecutive pair of points is a rigid
+link, so its length must be identical across every pose, reachable or not.
+`test_mirror.py` checks that segment-length invariant against 5 named poses
+(including the extreme `home`/`lower`/`place` tuned poses) and 200 random
+joint-space samples — a bug in the `EE_OFFSET` correction would show up
+immediately as a length that moves with the pose, not as a subtle numeric
+drift.
+
+### Where a stick's base/tip come from for the rig
+
+`ops/mirror.py` deliberately reads a stick's placement back off the
+**build mesh** (converted `blender_to_robot`), not off the design — the
+build mesh already reflects any `flip` (Sec 6 makes "base" structural once
+an order exists, superseding Phase B's reachability-driven default). The
+resulting `(base, tip)` goes straight into
+`kinematics.grasp.solve_stick_placement()` — the *exact* function
+`PlaceStick` calls on the ROS2 side (Sec 7.2) — so the rig shows the same
+joint solution the robot would actually use, not an independently-derived
+approximation of it.
+
+### Tested three ways, matching Sec 12's own layering
+
+1. `core/mirror.py` against the vendored `fk()` directly (the invariant
+   above) — no Blender needed.
+2. `ops/mirror.py`'s operators executed for real inside Blender
+   (`test_blender_integration.py::TestMirrorRig`): toggle show/hide, wrap-
+   around stepping, object cleanup on `unregister()`, and a geometric check
+   that the rig's TCP point lands within 1 mm of the stick's own
+   `grasp_target()` — proving the rig is posed *at* the stick, not just
+   that something got drawn.
+3. The new panel's `draw()` itself, smoke-tested in a real **windowed**
+   Blender instance — `blender --background` cannot fire panel draw
+   callbacks at all (Phase C's own finding), so a typo in a `layout.prop()`
+   or `operator()` call is invisible to every other layer. Registered a
+   throwaway Properties-editor panel that calls `SO100_PT_preview.draw()`
+   directly (the always-visible-tab trick from Phase C), toggled the mirror
+   on and stepped it once first so the fuller draw path (prev/next buttons,
+   status line) actually executes, and confirmed one clean call.

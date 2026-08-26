@@ -1,4 +1,6 @@
-"""3D View sidebar, category "SO-100". BLENDER_ADDON_PLAN.md Sec 10.
+"""3D View sidebar, category "RA130" (Robot Arm 130 -- the addon's own name,
+not either supported robot's; multi-robot support means it is no longer
+just "SO-100"). BLENDER_ADDON_PLAN.md Sec 10.
 
 Phase A ships the `Design` panel (Sec 10.1) plus the stick list from the
 `Build` panel (Sec 10.3), because seeing per-stick lengths and residuals is
@@ -10,31 +12,23 @@ Phases C/D/E.
 import bpy
 from bpy.types import Panel, UIList
 
+from ..core import robots as core_robots
 from ..core import state as core_state
-from ..kinematics import constants as kc
+from ..ops.design import base_empty_name
+# so_arm_100-only reachability caveats (GRASP_OFFSET_M) in SO100_PT_reference
+# below -- core/sticks.py / core/order.py have the same, still-open
+# limitation (multi-robot support, docs/STATUS.md 2026-08-21 / 2026-08-23).
+from ..kinematics.so_arm_100 import constants as kc
 
-CATEGORY = "SO-100"
+# Each robot's own URDF root frame name (used only for this label -- see
+# each kinematics package's own README; not part of the interface contract
+# in core/robots.py, so not read from there).
+_FRAME_NAMES = {
+    core_robots.SO_ARM_100_ID: "base_link",
+    core_robots.KR10_R900_2_ID: "base",
+}
 
-
-def build_order_permutation(orders):
-    """``[build_order_per_item] -> [display_position_per_item]``.
-
-    Blender's ``filter_items`` wants a permutation in that direction (the
-    new position *of* item i), not a sorted index list -- getting it
-    backwards silently scrambles the list rather than erroring, so this is
-    split out to be unit-testable without a running UI.
-
-    Unordered sticks (``order == -1``) sort last, keeping their relative
-    order, so a partial solve still reads sensibly.
-    """
-    ranked = sorted(
-        range(len(orders)),
-        key=lambda i: (orders[i] < 0, orders[i] if orders[i] >= 0 else i),
-    )
-    permutation = [0] * len(orders)
-    for position, original_index in enumerate(ranked):
-        permutation[original_index] = position
-    return permutation
+CATEGORY = "RA130"
 
 
 class SO100_UL_sticks(UIList):
@@ -70,7 +64,7 @@ class SO100_UL_sticks(UIList):
         props = context.scene.so100
         if not props.sort_by_build_order or not props.has_order:
             return [], []
-        return [], build_order_permutation(
+        return [], core_state.build_order_permutation(
             [item.order for item in getattr(data, propname)])
 
 
@@ -88,9 +82,22 @@ class SO100_PT_design(SO100PanelBase, Panel):
         layout = self.layout
         props = context.scene.so100
 
+        layout.prop(props, "robot_id", text="Robot", icon="ARMATURE_DATA")
+        if props.robot_id != core_robots.DEFAULT_ROBOT_ID:
+            profile = core_robots.get_robot(props.robot_id)
+            if not profile.is_vendored:
+                layout.label(
+                    text="Not vendored yet -- validation/export will report why",
+                    icon="ERROR",
+                )
+
         column = layout.column(align=True)
         if props.base_empty is None:
-            column.operator("so100.create_base_empty", icon="EMPTY_ARROWS")
+            column.operator(
+                "so100.create_base_empty",
+                text="Create %s" % base_empty_name(props.robot_id),
+                icon="EMPTY_ARROWS",
+            )
         column.prop(props, "base_empty", text="Base", icon="EMPTY_ARROWS")
         column.prop(props, "design_mesh", text="Mesh", icon="MESH_DATA")
 
@@ -104,6 +111,7 @@ class SO100_PT_design(SO100PanelBase, Panel):
         column = box.column(align=True)
         column.prop(props, "section_mm")
         column.prop(props, "joint_allowance_mm")
+        box.operator("so100.reset_stock_to_robot_defaults", icon="LOOP_BACK")
 
         box = layout.box()
         box.label(text="Stick Length", icon="DRIVER_DISTANCE")
@@ -118,7 +126,13 @@ class SO100_PT_design(SO100PanelBase, Panel):
         box.label(text="Mesh Expansion", icon="MOD_MESHDEFORM")
         box.label(text="Sticks keep their length; the design grows.", icon="INFO")
         box.prop(props, "growth_mode", text="Growth")
-        box.prop(props, "ground_mode", text="Ground")
+        box.prop(props, "require_build_plate")
+        if props.require_build_plate:
+            box.prop(props, "ground_mode", text="Ground")
+            box.prop(props, "build_plate_height_mm")
+        else:
+            box.label(
+                text="No plate check -- you supply the support", icon="INFO")
 
         layout.prop(props, "show_advanced", icon="PREFERENCES")
         if props.show_advanced:
@@ -330,6 +344,43 @@ def _next_stick_item(props):
     return None
 
 
+class SO100_PT_preview(SO100PanelBase, Panel):
+    """Sec 10.4: a rig posed by the vendored FK, scrubbed through the build
+    order -- a printer-style preview of the whole job before anything
+    moves. No telemetry / live robot link (Option C has none, Sec 2)."""
+
+    bl_idname = "SO100_PT_preview"
+    bl_label = "Preview"
+
+    @classmethod
+    def poll(cls, context):
+        return len(context.scene.so100.sticks) > 0
+
+    def draw(self, context):
+        layout = self.layout
+        props = context.scene.so100
+
+        row = layout.row(align=True)
+        row.operator(
+            "so100.mirror_toggle",
+            text="Hide Robot Mirror" if props.show_mirror else "Show Robot Mirror",
+            icon="ARMATURE_DATA",
+            depress=props.show_mirror,
+        )
+
+        if not props.has_order:
+            layout.label(text="Compute a build order first.", icon="INFO")
+            return
+
+        if props.show_mirror:
+            row = layout.row(align=True)
+            row.operator("so100.mirror_step", text="", icon="TRIA_LEFT").direction = -1
+            row.label(text="%d / %d" % (props.mirror_index + 1, _ordered_count(props)))
+            row.operator("so100.mirror_step", text="", icon="TRIA_RIGHT").direction = 1
+            if props.mirror_status:
+                layout.label(text=props.mirror_status)
+
+
 class SO100_PT_sticks(SO100PanelBase, Panel):
     bl_idname = "SO100_PT_sticks"
     bl_label = "Sticks"
@@ -367,6 +418,15 @@ class SO100_PT_sticks(SO100PanelBase, Panel):
                         icon="VIEWZOOM")
             row.operator("so100.step_stick", text="", icon="TRIA_RIGHT").direction = 1
 
+            if props.has_order and item.order >= 0:
+                box.label(text="Build position: %d of %d" % (
+                    item.order + 1, len(props.sticks)))
+                row = box.row(align=True)
+                row.operator("so100.move_build_step", text="Move Earlier",
+                             icon="TRIA_UP").direction = -1
+                row.operator("so100.move_build_step", text="Move Later",
+                             icon="TRIA_DOWN").direction = 1
+
             for code in item.warning_list():
                 box.label(text=code.replace("_", " "), icon="ERROR")
             if item.reason:
@@ -383,21 +443,41 @@ class SO100_PT_reference(SO100PanelBase, Panel):
     bl_label = "Reference"
     bl_options = {"DEFAULT_CLOSED"}
 
-    def draw(self, _context):
+    def draw(self, context):
         layout = self.layout
-        column = layout.column(align=True)
-        column.label(text="Build volume (base_link, N2):")
-        column.label(text="  X %+.0f .. %+.0f mm" % (kc.BUILD_VOLUME_MIN_M[0] * 1000.0,
-                                                     kc.BUILD_VOLUME_MAX_M[0] * 1000.0))
-        column.label(text="  Y %+.0f .. %+.0f mm" % (kc.BUILD_VOLUME_MIN_M[1] * 1000.0,
-                                                     kc.BUILD_VOLUME_MAX_M[1] * 1000.0))
-        column.label(text="  Z %+.0f .. %+.0f mm" % (kc.BUILD_VOLUME_MIN_M[2] * 1000.0,
-                                                     kc.BUILD_VOLUME_MAX_M[2] * 1000.0))
-        layout.label(text="98%% reachable for vertical sticks.", icon="INFO")
+        props = context.scene.so100
+        profile = core_robots.get_robot(props.robot_id)
+        frame = _FRAME_NAMES.get(props.robot_id, props.robot_id)
 
-        box = layout.box()
-        box.label(text="Grip height %.0f mm (derived, not measured)"
-                       % (kc.GRASP_OFFSET_M * 1000.0), icon="ERROR")
+        column = layout.column(align=True)
+        column.label(text="Build volume (%s, %s):" % (frame, props.robot_id))
+        if profile.has_build_volume:
+            lo, hi = profile.build_volume_min_m, profile.build_volume_max_m
+            column.label(text="  X %+.0f .. %+.0f mm" % (lo[0] * 1000.0, hi[0] * 1000.0))
+            column.label(text="  Y %+.0f .. %+.0f mm" % (lo[1] * 1000.0, hi[1] * 1000.0))
+            column.label(text="  Z %+.0f .. %+.0f mm" % (lo[2] * 1000.0, hi[2] * 1000.0))
+        else:
+            column.label(text="  Not confirmed for this robot yet", icon="ERROR")
+
+        if profile.has_base_box:
+            column = layout.column(align=True)
+            column.label(text="Robot base box (viewport reference only):")
+            lo, hi = profile.base_box_min_m, profile.base_box_max_m
+            column.label(text="  X %+.0f .. %+.0f mm" % (lo[0] * 1000.0, hi[0] * 1000.0))
+            column.label(text="  Y %+.0f .. %+.0f mm" % (lo[1] * 1000.0, hi[1] * 1000.0))
+            column.label(text="  Z %+.0f .. %+.0f mm" % (lo[2] * 1000.0, hi[2] * 1000.0))
+
+        # so_arm_100-specific empirical facts (ROS2 doc Sec 9.4's N2 finding,
+        # and its own GRASP_OFFSET_M caveat) -- do not generalize these to a
+        # robot they were never measured against.
+        if props.robot_id == core_robots.SO_ARM_100_ID:
+            # Not a %-format string, so a literal "%" here (not "%%") --
+            # found while adding translations (i18n.py), which is why the
+            # dict key below has to match this exact corrected text.
+            layout.label(text="98% reachable for vertical sticks.", icon="INFO")
+            box = layout.box()
+            box.label(text="Grip height %.0f mm (derived, not measured)"
+                           % (kc.GRASP_OFFSET_M * 1000.0), icon="ERROR")
 
 
 def _wrap(text, width):
@@ -420,6 +500,7 @@ _CLASSES = (
     SO100_PT_summary,
     SO100_PT_plan,
     SO100_PT_build,
+    SO100_PT_preview,
     SO100_PT_sticks,
     SO100_PT_reference,
 )

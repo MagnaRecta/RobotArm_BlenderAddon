@@ -15,8 +15,8 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-from so100_builder.kinematics.chain import Unreachable, fk, ik, tool_elevation_rad
-from so100_builder.kinematics.envelope import is_reachable, sweep_envelope
+from so100_builder.kinematics.so_arm_100.chain import Unreachable, fk, ik, tool_elevation_rad
+from so100_builder.kinematics.so_arm_100.envelope import is_reachable, sweep_envelope
 
 # The five joint-space waypoints tuned by hand in RViz against the real
 # arm, verbatim from so_arm_100_pick_and_place/config/pick_and_place.yaml

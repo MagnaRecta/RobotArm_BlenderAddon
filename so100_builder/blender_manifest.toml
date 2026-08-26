@@ -9,7 +9,7 @@ schema_version = "1.0.0"
 
 id = "so100_builder"
 version = "0.1.0"
-name = "SO-100 Stick Builder"
+name = "RA130 Stick Builder"
 tagline = "Slice a wireframe mesh into a robot-buildable stick sculpture"
 maintainer = "MagnaRecta <tono_war@hotmail.com>"
 type = "add-on"

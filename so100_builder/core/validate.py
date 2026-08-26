@@ -18,38 +18,30 @@ contradicts this: such placements ARE reachable, verified to <0.05 deg by
 round-tripping the solved joints back through ``fk()``. That table entry
 should be corrected in the plan; this module does not encode it.
 
-## The grasp-orientation transform -- built here, not yet on the ROS2 side
+## The grasp-orientation transform lives in the shared kinematics package
 
 Converting a stick's desired 3D orientation into the ``(tool_elevation_rad,
-stick_roll_rad)`` pair ``chain.ik()`` takes is genuinely non-trivial, and is
-explicitly unbuilt on the ROS2 side too (its own Phase 1 checklist: "the
-transform helper ... are not written yet"). The derivation below is grounded
-entirely in facts ``chain.py`` already states and tests
-(``Shoulder_Pitch``/``Elbow``/``Wrist_Pitch`` is exactly planar; the stick is
-held perpendicular to the tool axis; ``Wrist_Roll`` never moves the TCP), not
-in anything new about the physical arm. Two non-obvious findings from
-building it, both confirmed empirically against ``fk()``/``ik()``, not
-assumed:
+stick_roll_rad)`` pair ``chain.ik()`` takes is genuinely non-trivial. It was
+first built here, then promoted into ``so_arm_100_kinematics.grasp`` (version
+1.1.0) so the ROS2 side's ``PlaceStick`` action uses the exact same,
+self-verifying search this module does -- the two sides sharing one
+derivation is the entire point of vendoring rather than reimplementing (see
+README.md). This module now only calls
+``kinematics.grasp.solve_stick_orientation`` / ``grasp_target``; it does not
+derive orientations itself. Two non-obvious findings from building it, both
+confirmed empirically against ``fk()``/``ik()`` and documented in full in
+``kinematics/grasp.py``:
 
 1. **The reference stick direction points from the grip toward the stick's
-   BASE, not its tip.** ``rot(joints) @ (0, 0, 1)`` (the tool frame's local Z
-   column) is a valid representation of "which way the stick points" --
-   confirmed by matching all five tuned poses' known-vertical stick, all of
-   which come out as *negative* Z. That makes physical sense once you notice
-   the grip point sits *above* the stick's base (``GRASP_OFFSET_M`` up from
-   it) -- the direction from grip to base is downward. Get this sign wrong
-   and every roll solve is off by ~180 deg, silently pushing ``Wrist_Roll``
-   out of its limit for placements that are actually fine.
+   BASE, not its tip.** Get this sign wrong and every roll solve is off by
+   ~180 deg, silently pushing ``Wrist_Roll`` out of its limit for placements
+   that are actually fine.
 2. **The elevation equation has two roots 180 deg apart**, and only one of
-   them puts the roll=0 reference direction anywhere near the target (the
-   other requires ~180 deg of roll to compensate, which is usually
-   unreachable). There is no way to know which root is right without trying
-   both -- so ``_solve_orientation`` below tries both elevation roots and
-   both elbow branches (4 combinations; ``Shoulder_Rotation`` itself has no
-   branch ambiguity, so this is exhaustive) and **verifies every candidate by
-   feeding the solved joints back through ``fk()`` and checking the achieved
-   direction**, rather than trusting the closed-form roll formula on its own.
-   A candidate is only ever accepted once measured, not derived and assumed.
+   them puts the roll=0 reference direction anywhere near the target. There
+   is no way to know which root is right without trying both -- so the
+   shared solver tries both elevation roots and both elbow branches and
+   **verifies every candidate by feeding the solved joints back through
+   ``fk()``**, rather than trusting the closed-form roll formula on its own.
 
 Because the search is exhaustive and self-verifying, "no candidate verifies"
 means the placement is genuinely unreachable with this arm -- not merely
@@ -76,25 +68,38 @@ one to run into something this module does not model (self-collision, an
 awkward approach path) once MoveIt actually plans it. The warning exists so
 the user notices and can eyeball it, not because the reachability verdict
 itself is in doubt.
+
+## Multi-robot (docs/STATUS.md "Multi-robot support kicked off 2026-08-21")
+
+Everything above is ``so_arm_100``-specific -- the exact-root/cardinal-anchor
+search, the asymmetric-``Wrist_Roll`` flip suggestion, the out-of-plane
+warning -- and stays that way verbatim (this generalization must not change
+so_arm_100's own verdicts; see ``core/robots.py``'s module docstring). It now
+lives in :func:`_validate_stick_so_arm_100`, reached only when
+``robot_id == core_robots.SO_ARM_100_ID`` (the default).
+
+``kr10_r900_2`` (vendored 2026-08-22) gets its own path too --
+:func:`_validate_stick_kr10_r900_2` -- rather than the generic fallback,
+because that robot's stock is round with a genuinely free roll DOF: the
+single-roll ``solve_stick_placement`` under-reports reachability for it, so
+this path calls ``solve_stick_placement_any_roll`` instead (sweeps roll x
+branch; see ``core/robots.py``'s module docstring for why this could not be
+folded into one shared "contract" function name across robots).
+
+Any *other* robot id -- none registered yet -- falls through to
+:func:`_validate_stick_generic`, which uses only ``solve_stick_placement``
+positionally (``base``, ``tip``) and turns any failure into a clean
+``Verdict``. It is a safety net for a future third robot before it has
+earned its own richer path, not a design to converge on.
 """
 
 import math
 
-from ..kinematics import chain as kchain
-from ..kinematics import envelope as kenvelope
-from ..kinematics.constants import CHAIN, GRASP_OFFSET_M
-from .transform import v_add, v_cross, v_dot, v_normalized, v_scale
+from . import robots as core_robots
+from .transform import v_dot, v_normalized
 
-# Shoulder_Rotation's own origin -- every azimuth is measured from here.
-# Imported from the submodule directly since the curated kinematics
-# __init__ doesn't re-export CHAIN; this reads the vendored package's own
-# public data, it does not modify or fork it.
-_SHOULDER_AXIS_POINT = CHAIN[0][1]
-
-# How far a candidate's achieved direction may miss the target before it's
-# rejected rather than accepted (Sec "empirically verified" above). Tight:
-# this is a numerical round-trip check, not a manufacturing tolerance.
-_VERIFY_TOLERANCE_DEG = 0.05
+_SO_ARM_100 = core_robots.get_robot(core_robots.SO_ARM_100_ID)
+_so_arm_100_kinematics = _SO_ARM_100.kinematics
 
 # Finding 4 (empirical, 2026-07-29): near a genuinely degenerate direction
 # (both a_r and a_z small -- i.e. close to horizontal-tangential), the
@@ -109,32 +114,30 @@ _VERIFY_TOLERANCE_DEG = 0.05
 # 9.4: vertical/horizontal-radial/horizontal-tangential all sit at
 # elevation 0 or +-90 deg exactly) reaches it fine with only a few degrees
 # of orientation error. So the exact roots alone are not a reliable
-# search -- see _CARDINAL_ANCHORS below.
+# search -- ``kinematics.grasp`` also tries the four cardinal anchors.
 #
-# The tolerance for accepting an anchor is grounded in the joint's own
-# physical slack, not chosen to make a specific failing case pass: the
-# glue gap (3.25-6.5 mm, JOINT_ALLOWANCE_M) already absorbs some
-# imprecision, and over a ~110 mm stick that gap alone corresponds to
-# asin(3.25/110)..asin(6.5/110) =~ 1.7..3.4 deg of angular slack before
-# the joint's own designed-in gap is exceeded. 5 deg has comfortable
-# margin above that (covers a real case found at 2.08 deg) while staying
-# far below where an actual bug shows up (every wrong-branch bug found so
-# far was off by 15-180 deg, not single digits) -- see
+# The tolerance for accepting an anchor (``kgrasp.ANCHOR_TOLERANCE_DEG``) is
+# grounded in the joint's own physical slack, not chosen to make a specific
+# failing case pass: the glue gap (3.25-6.5 mm, JOINT_ALLOWANCE_M) already
+# absorbs some imprecision, and over a ~110 mm stick that gap alone
+# corresponds to asin(3.25/110)..asin(6.5/110) =~ 1.7..3.4 deg of angular
+# slack before the joint's own designed-in gap is exceeded. 5 deg has
+# comfortable margin above that (covers a real case found at 2.08 deg)
+# while staying far below where an actual bug shows up (every wrong-branch
+# bug found so far was off by 15-180 deg, not single digits) -- see
 # tests/test_validate.py's TestNearDegenerateElevationBranch for the case
 # that set this number.
-_ANCHOR_TOLERANCE_DEG = 5.0
-_CARDINAL_ANCHORS_RAD = (0.0, math.pi / 2.0, math.pi, -math.pi / 2.0)
 
 # Below this, an accepted candidate's residual error is treated as "the
 # exact math basically worked" and not called out separately -- it is
-# indistinguishable from the numerical round-trip noise _VERIFY_TOLERANCE_
-# DEG already tolerates for the exact-root path.
+# indistinguishable from the numerical round-trip noise
+# kgrasp.VERIFY_TOLERANCE_DEG already tolerates for the exact-root path.
 _APPROXIMATION_NOTEWORTHY_DEG = 0.5
 
 # Sec 9.4: warn when a stick's tilt has a meaningful component outside the
 # arm's own vertical plane -- untested territory even though reachable.
-# Matches _ANCHOR_TOLERANCE_DEG's physical grounding (deliberately, not by
-# coincidence): a stick a few degrees off pure vertical/radial/tangential
+# Matches kgrasp.ANCHOR_TOLERANCE_DEG's physical grounding (deliberately,
+# not by coincidence): a stick a few degrees off pure vertical/radial/tangential
 # from ordinary hand-drawn imprecision is not a genuine mixed tilt worth
 # flagging as untested territory -- it is the same normal geometric slack
 # the joint's own glue gap already absorbs. Found too low at 2 deg
@@ -142,14 +145,14 @@ _APPROXIMATION_NOTEWORTHY_DEG = 0.5
 # tangential stick (2.077 deg off) tripped it, alongside the unrelated
 # WARN_ORIENTATION_APPROXIMATED -- redundant noise for the same underlying
 # cause, not two distinct things worth separately flagging.
-OUT_OF_PLANE_WARN_THRESHOLD_RAD = math.radians(_ANCHOR_TOLERANCE_DEG)
+OUT_OF_PLANE_WARN_THRESHOLD_RAD = math.radians(_so_arm_100_kinematics.ANCHOR_TOLERANCE_DEG)
 
 WARN_OUT_OF_PLANE_TILT = "out_of_plane_tilt"
 # The accepted orientation is a nearby approximation (an anchor pose),
-# not an exact solution -- see the _ANCHOR_TOLERANCE_DEG derivation above.
-# The stick will be placed a few degrees off the drawn direction; still
-# well inside the joint's own glue-gap slack, but worth being visible
-# about rather than silent.
+# not an exact solution -- see kgrasp.ANCHOR_TOLERANCE_DEG's derivation in
+# kinematics/grasp.py. The stick will be placed a few degrees off the drawn
+# direction; still well inside the joint's own glue-gap slack, but worth
+# being visible about rather than silent.
 WARN_ORIENTATION_APPROXIMATED = "orientation_approximated"
 # Applied by ops/design.py, not this module -- kept here so every warning
 # code the UI can show has one home. Set when `suggested_flip` above caused
@@ -179,154 +182,28 @@ class Verdict:
         )
 
 
-def stick_grasp_target(stick):
+def stick_grasp_target(stick, kinematics_module=_so_arm_100_kinematics):
     """TCP target for PLACING this stick: the grip point along its own
     axis, GRASP_OFFSET_M from the base end -- ROS2_IMPLEMENTATION_PLAN.md
-    Sec 8.2's ``T_target_tcp`` formula. This is the position half of the
-    transform (unaffected by the orientation-sign finding above: the grip
-    point is offset from base *toward* tip, regardless of which direction
-    counts as the IK's own "roll=0 reference").
+    Sec 8.2's ``T_target_tcp`` formula. Thin domain-object wrapper around
+    ``kinematics_module.grasp_target`` (which takes plain coordinates, not a
+    ``StickSpec``). ``kinematics_module`` defaults to ``so_arm_100`` --
+    every caller of this helper today is the so_arm_100-specific path below.
     """
-    axis = stick.axis()
-    return v_add(stick.base, v_scale(axis, GRASP_OFFSET_M))
+    return kinematics_module.grasp_target(stick.base, stick.tip)
 
 
-def _stick_axis_from_joints(joint_angles_rad):
-    """The tool frame's local Z column -- see module docstring finding 1:
-    this points from the grip toward the stick's BASE."""
-    _pos, rot = kchain.fk(joint_angles_rad)
-    return (rot[0][2], rot[1][2], rot[2][2])
-
-
-def _wrap_angle(angle_rad):
-    """Wrap to (-pi, pi]. ik() does not wrap its own joint-angle solutions
-    before comparing them against joint limits (chain.py never needs to,
-    since its own callers always pass a small, already-sane elevation) --
-    so ``elevation0 + pi`` landing near +2*pi instead of near 0 makes a
-    perfectly fine configuration look like it exceeds a limit it doesn't
-    (e.g. a Wrist_Pitch solution of "-424.84 deg" that is really -64.84 deg
-    once wrapped). Always pass ik() a canonical-range elevation."""
-    return (angle_rad + math.pi) % (2.0 * math.pi) - math.pi
-
-
-def _azimuth_basis(target_xyz_m):
-    """r_hat (radial, horizontal), z_hat (vertical), tan_hat (tangential /
-    out-of-plane horizontal) at the target's azimuth from
-    Shoulder_Rotation's axis."""
-    dx = target_xyz_m[0] - _SHOULDER_AXIS_POINT[0]
-    dy = target_xyz_m[1] - _SHOULDER_AXIS_POINT[1]
-    rho = math.hypot(dx, dy)
-    if rho < 1e-9:
-        return None
-    r_hat = (dx / rho, dy / rho, 0.0)
-    tan_hat = (-r_hat[1], r_hat[0], 0.0)
-    return r_hat, (0.0, 0.0, 1.0), tan_hat
-
-
-def _try_elevation(target_xyz_m, elevation, grip_dir, tolerance_deg):
-    """One (elevation, both elbow branches) probe. Returns the best
-    ``(elevation, roll, elbow_up, error_deg)`` of the branches that verify
-    within ``tolerance_deg``, or ``None``."""
-    best = None
-    for elbow_up in (True, False):
-        try:
-            q_ref = kchain.ik(target_xyz_m, elevation, stick_roll_rad=0.0, elbow_up=elbow_up)
-        except kchain.Unreachable:
-            continue
-        ref_axis = _stick_axis_from_joints(q_ref)
-        tool = kchain.tool_axis(q_ref)
-        # Sign convention finding 3 (empirical, like findings 1-2 above):
-        # increasing stick_roll_rad rotates the stick CLOCKWISE around
-        # tool_axis(), opposite the standard right-hand convention a naive
-        # cross-product formula assumes. Invisible in-plane (there
-        # sin(roll) is always ~0, so only |roll| -- sign-independent -- is
-        # ever exercised); only shows up once grip_dir has a genuine
-        # tangential component. Caught by round-trip verification below,
-        # not by this line looking "obviously" right -- do not simplify
-        # this back to +tool without re-running that verification.
-        roll = math.atan2(
-            -v_dot(v_cross(ref_axis, grip_dir), tool), v_dot(ref_axis, grip_dir)
-        )
-        try:
-            q = kchain.ik(target_xyz_m, elevation, stick_roll_rad=roll, elbow_up=elbow_up)
-        except kchain.Unreachable:
-            continue
-        achieved = _stick_axis_from_joints(q)
-        cos_err = max(-1.0, min(1.0, v_dot(grip_dir, achieved)))
-        error_deg = math.degrees(math.acos(cos_err))
-        if error_deg > tolerance_deg:
-            continue
-        if best is None or error_deg < best[3]:
-            best = (elevation, roll, elbow_up, error_deg)
-    return best
-
-
-def _solve_orientation(target_xyz_m, base_to_tip_axis):
-    """Exhaustive, self-verifying search for ``(tool_elevation_rad,
-    stick_roll_rad, elbow_up)`` placing the stick along ``base_to_tip_axis``
-    at ``target_xyz_m``. Returns ``None`` if no candidate reproduces the
-    target direction within tolerance -- see module docstring for why that
-    means genuinely unreachable, not merely unchecked.
-
-    Tries two families of candidate elevation, for the reason in Finding 4:
-
-    * The two **exact roots** of the perpendicularity equation (elevation0,
-      elevation0 + pi) -- verified tight (0.05 deg). For a well-conditioned
-      target (the common case) this is exact, and is preferred whenever it
-      succeeds.
-    * The four **cardinal anchors** (0, +-90, 180 deg) -- Sec 9.4's own
-      documented poses for vertical/horizontal-radial/horizontal-tangential
-      -- verified against the physically-grounded ``_ANCHOR_TOLERANCE_DEG``
-      (see its own derivation), to absorb the geometric noise the
-      mesh-expansion solver routinely introduces near exactly these
-      directions without accepting a genuinely wrong orientation.
-
-    All verified candidates compete on smallest achieved error first (an
-    exact root beats an anchor whenever both succeed), then smallest |roll|
-    to break remaining ties.
-
-    Returns ``(elevation, roll, elbow_up, error_deg)`` -- the caller decides
-    whether ``error_deg`` (always < ``_VERIFY_TOLERANCE_DEG`` for an exact
-    root, possibly up to ``_ANCHOR_TOLERANCE_DEG`` for an anchor) is worth
-    surfacing to the user.
+def _validate_stick_so_arm_100(stick):
+    """Sec 7's reachability + orientation checks for one stick, against
+    so_arm_100's own kinematics. Does not include jaw clearance / collision
+    against neighbours -- see module docstring; that is Phase C, once a
+    build order gives it something real to check against.
     """
-    basis = _azimuth_basis(target_xyz_m)
-    if basis is None:
-        return None
-    r_hat, _z_hat, _tan_hat = basis
-
-    # Finding 1: the reference direction points grip-to-base, not base-tip.
-    grip_dir = v_normalized(tuple(-c for c in base_to_tip_axis))
-    a_r = v_dot(grip_dir, r_hat)
-    a_z = grip_dir[2]
-    elevation0 = 0.0 if (abs(a_r) < 1e-12 and abs(a_z) < 1e-12) else math.atan2(-a_r, a_z)
-
-    candidates = []
-    for elevation in (_wrap_angle(elevation0), _wrap_angle(elevation0 + math.pi)):
-        found = _try_elevation(target_xyz_m, elevation, grip_dir, _VERIFY_TOLERANCE_DEG)
-        if found is not None:
-            candidates.append(found)
-    for elevation in _CARDINAL_ANCHORS_RAD:
-        found = _try_elevation(target_xyz_m, elevation, grip_dir, _ANCHOR_TOLERANCE_DEG)
-        if found is not None:
-            candidates.append(found)
-
-    if not candidates:
-        return None
-    candidates.sort(key=lambda c: (c[3], abs(c[1])))
-    return candidates[0]
-
-
-def validate_stick(stick):
-    """Sec 7's reachability + orientation checks for one stick. Does not
-    include jaw clearance / collision against neighbours -- see module
-    docstring; that is Phase C, once a build order gives it something real
-    to check against.
-    """
-    target = stick_grasp_target(stick)
+    kgrasp = _so_arm_100_kinematics
+    target = stick_grasp_target(stick, kgrasp)
     axis = stick.axis()
 
-    basis = _azimuth_basis(target)
+    basis = kgrasp.azimuth_frame(target)
     if basis is None:
         return Verdict(False, "target lies on the Shoulder_Rotation axis -- azimuth undefined")
     r_hat, _z_hat, tan_hat = basis
@@ -348,7 +225,7 @@ def validate_stick(stick):
     if min(angle_from_in_plane, angle_from_tangential) > OUT_OF_PLANE_WARN_THRESHOLD_RAD:
         warnings.append(WARN_OUT_OF_PLANE_TILT)
 
-    solved = _solve_orientation(target, axis)
+    solved = kgrasp.solve_stick_orientation(target, axis)
     if solved is None:
         # Finding 6 (empirical, 2026-07-30): Wrist_Roll's limit is
         # ASYMMETRIC (roughly -157..+68 deg, since WRIST_ROLL_AT_ZERO_
@@ -364,7 +241,7 @@ def validate_stick(stick):
         # and can pick either end. `sticks.py` already exposes a per-stick
         # `flip` override for exactly this -- check it here so the
         # suggestion is concrete and verified, not a guess.
-        flipped_solved = _solve_orientation(target, tuple(-c for c in axis))
+        flipped_solved = kgrasp.solve_stick_orientation(target, tuple(-c for c in axis))
         if flipped_solved is not None:
             return Verdict(
                 False,
@@ -385,7 +262,7 @@ def validate_stick(stick):
         grip_dir = v_normalized(tuple(-c for c in axis))
         a_r, a_z = v_dot(grip_dir, r_hat), grip_dir[2]
         elevation0 = 0.0 if (abs(a_r) < 1e-12 and abs(a_z) < 1e-12) else math.atan2(-a_r, a_z)
-        reachable, reason = kenvelope.is_reachable(target, elevation0, stick_roll_rad=0.0)
+        reachable, reason = kgrasp.is_reachable(target, elevation0, stick_roll_rad=0.0)
         if not reachable:
             return Verdict(False, reason, tuple(warnings))
         return Verdict(
@@ -402,9 +279,90 @@ def validate_stick(stick):
     return Verdict(True, None, tuple(warnings))
 
 
-def validate_sticks(sticks):
+def _validate_stick_kr10_r900_2(stick, kinematics_module):
+    """Reachability check for kr10_r900_2. Unlike so_arm_100's square stock
+    (roll fixed by the design, always 0 -- see ``io/build_file.py``'s own
+    comment on ``roll_deg``), this robot's stock is round (KUKA_IMPLEMENTATION_
+    PLAN.md KQ6) with NO physically-preferred roll for grasping alone (see
+    that package's own ``grasp.py`` docstring) -- so a single fixed-roll
+    attempt would report plenty of genuinely-buildable sticks as impossible.
+    ``solve_stick_placement_any_roll`` sweeps roll x (elbow_up, wrist_flip)
+    and is exact per attempt (no round-trip verification needed, unlike
+    so_arm_100 -- see that package's own ``chain.py`` docstring), so "every
+    combination fails" means genuinely unreachable, matching this file's own
+    so_arm_100 section's same standard.
+
+    Tries the flipped base/tip assignment on failure for the same reason the
+    so_arm_100 path does: which end a design calls "base" is a structural
+    tie-break (Sec 5.1), not a guarantee that assignment is the reachable one.
+    """
+    try:
+        kinematics_module.solve_stick_placement_any_roll(stick.base, stick.tip)
+        return Verdict(True)
+    except kinematics_module.Unreachable as forward_exc:
+        try:
+            kinematics_module.solve_stick_placement_any_roll(stick.tip, stick.base)
+        except kinematics_module.Unreachable:
+            return Verdict(False, str(forward_exc))
+        return Verdict(
+            False,
+            "%s -- but the opposite end works, toggle this stick's 'Flip' "
+            "setting" % forward_exc,
+            suggested_flip=True,
+        )
+
+
+def _validate_stick_generic(stick, kinematics_module):
+    """Contract-only reachability check for any robot besides so_arm_100 --
+    see the module docstring's "Multi-robot" section. Uses nothing but
+    ``solve_stick_placement`` (``core/robots.py``'s interface contract), and
+    tries the flipped base/tip assignment on failure the same way the
+    so_arm_100 path does, for the same reason (Sec 5.1's "base = lower Z"
+    default is a tie-break, not a guarantee either end is the right choice).
+
+    Deliberately broad ``except Exception``: a not-yet-vendored placeholder
+    package (``kinematics/kr10_r900_2/``) raises a plain ``RuntimeError`` the
+    moment any of its attributes are touched, not necessarily the contract's
+    own ``Unreachable`` -- and this function's whole job is to turn *any*
+    failure from an arbitrary robot module into a clean ``Verdict`` rather
+    than let it crash the extraction pipeline.
+    """
+    try:
+        kinematics_module.solve_stick_placement(stick.base, stick.tip)
+        return Verdict(True)
+    except Exception as forward_exc:
+        try:
+            kinematics_module.solve_stick_placement(stick.tip, stick.base)
+        except Exception:
+            return Verdict(False, str(forward_exc))
+        return Verdict(
+            False,
+            "%s -- but the opposite end works, toggle this stick's 'Flip' "
+            "setting" % forward_exc,
+            suggested_flip=True,
+        )
+
+
+def validate_stick(stick, robot_id=core_robots.SO_ARM_100_ID):
+    """Sec 7's reachability + orientation checks for one stick, against the
+    given robot. Does not include jaw clearance / collision against
+    neighbours -- see module docstring; that is Phase C, once a build order
+    gives it something real to check against.
+
+    ``robot_id`` defaults to so_arm_100 so every pre-existing caller (tests
+    included) keeps its exact original behaviour unchanged.
+    """
+    if robot_id == core_robots.SO_ARM_100_ID:
+        return _validate_stick_so_arm_100(stick)
+    kinematics_module = core_robots.get_robot(robot_id).kinematics
+    if robot_id == core_robots.KR10_R900_2_ID:
+        return _validate_stick_kr10_r900_2(stick, kinematics_module)
+    return _validate_stick_generic(stick, kinematics_module)
+
+
+def validate_sticks(sticks, robot_id=core_robots.SO_ARM_100_ID):
     """Validate a whole extraction result. Sec 7 (order-aware jaw
     clearance) is Phase C's addition once a build order exists; until then
     this is per-stick, independent of the others -- see module docstring.
     """
-    return {stick.id: validate_stick(stick) for stick in sticks}
+    return {stick.id: validate_stick(stick, robot_id) for stick in sticks}

@@ -17,9 +17,15 @@ from bpy.props import (
 )
 from bpy.types import PropertyGroup
 
+from .core import robots as core_robots
 from .core import sticks as core_sticks
 from .core import state as core_state
-from .kinematics import constants as kc
+# ⚠ Hardcoded to so_arm_100, same as core/sticks.py -- the UI defaults below
+# (stock section, length range, ...) stay so_arm_100's numbers regardless of
+# `robot_id` until a second robot's real numbers exist to switch to (see
+# core/robots.py's module docstring and BLENDER_ADDON_PLAN.md's registry
+# section for what is and is not yet robot-parameterized).
+from .kinematics.so_arm_100 import constants as kc
 
 # The integer attribute layer that makes ids stable across mesh edits
 # (Sec 9.2). Lives on the EDGE domain of the design mesh.
@@ -103,12 +109,35 @@ class SO100WarningItem(PropertyGroup):
 class SO100SceneProps(PropertyGroup):
     """Everything the Design panel drives (Sec 10.1)."""
 
+    # --- multi-robot (BRIDGE_PROTOCOL.md Sec A.1.1) -------------------------
+    robot_id: EnumProperty(
+        name="Robot",
+        description="Which robot this design targets. Stamped into the "
+                    "exported build file as `robot` (BRIDGE_PROTOCOL.md Sec "
+                    "A.1.1/A.2) -- the executor refuses to run a file meant "
+                    "for a different arm. Selecting a robot whose kinematics "
+                    "package isn't vendored yet degrades cleanly: validation, "
+                    "the mirror rig and Export Build File all report a clear "
+                    "reason instead of silently using the wrong arm's geometry",
+        items=[
+            (core_robots.SO_ARM_100_ID, "SO-100 (5-DOF)",
+             "so_arm_100_kinematics -- testing/dev rig. Closed-form IK, "
+             "vendored and hardware-validated"),
+            (core_robots.KR10_R900_2_ID, "KUKA KR10 R900-2 (6-DOF)",
+             "kr10_r900_2_kinematics -- production rig. Vendored 2026-08-22, "
+             "genuine 6-DOF closed-form IK"),
+        ],
+        default=core_robots.DEFAULT_ROBOT_ID,
+    )
+
     # --- scene pointers (Sec 9.1) ------------------------------------------
     base_empty: PointerProperty(
         type=bpy.types.Object, poll=_empty_object_poll,
-        name="SO-100 Base",
-        description="An Empty marking base_link. Moving it repositions the whole "
-                    "design relative to the robot with no re-authoring",
+        name="Robot Base",
+        description="An Empty marking the selected robot's own URDF root frame "
+                    "(`base_link` for so_arm_100, `base` for kr10_r900_2 -- see "
+                    "each kinematics package's own README). Moving it repositions "
+                    "the whole design relative to the robot with no re-authoring",
     )
     design_mesh: PointerProperty(
         type=bpy.types.Object, poll=_mesh_object_poll,
@@ -183,14 +212,35 @@ class SO100SceneProps(PropertyGroup):
         ],
         default="SLIDE",
     )
+    require_build_plate: BoolProperty(
+        name="Require Build Plate", default=True,
+        description="Uncheck for a design held by something this addon does not "
+                    "model at all -- a stick's own base used as a jig, a non-flat "
+                    "fixture -- rather than by a flat plate at any height. No "
+                    "vertex is then checked against a plate, nothing is ever "
+                    "reported as floating, and each disconnected part of the "
+                    "design starts from an arbitrary point instead of a grounded "
+                    "one. Does not verify the result is physically self-"
+                    "supporting -- you are responsible for how it is actually "
+                    "held during the build",
+    )
 
     # --- Sec 5.4: limits ----------------------------------------------------
     min_stick_length_mm: FloatProperty(
         name="Min Stick Length", default=kc.STICK_LENGTH_RANGE_M[0] * 1000.0,
-        min=core_sticks.hard_min_stick_length_m() * 1000.0, max=1000.0, precision=1,
-        description="Stock threshold. Its minimum is the hard physical floor "
-                    "(grip height + jaw margin) -- below that the jaws close at "
-                    "or above the stick's tip",
+        # The widget's own min= bound is fixed at class-registration time,
+        # so it cannot depend on which robot is selected -- it uses the
+        # SAFEST (lowest) floor across every registered robot, permissive
+        # enough to never block a value valid for whichever one is actually
+        # selected. The real, robot-SPECIFIC floor is enforced by
+        # extract_sticks() itself at extraction time (core/robots.py's
+        # module docstring; core/sticks.py's own note on the same limit).
+        min=core_sticks.safe_min_stick_length_bound_m() * 1000.0, max=1000.0, precision=1,
+        description="Stock threshold. Checked against the SELECTED robot's own "
+                    "hard physical floor (min grasp offset + jaw contact "
+                    "half-length) at extraction time -- below that, no offset "
+                    "both fits within the stick and clears the floor-clearance "
+                    "floor",
     )
     max_stick_length_mm: FloatProperty(
         name="Max Stick Length", default=kc.STICK_LENGTH_RANGE_M[1] * 1000.0,
@@ -211,9 +261,21 @@ class SO100SceneProps(PropertyGroup):
                     "is reported as one the sticks will not physically fit",
     )
     ground_epsilon_mm: FloatProperty(
-        name="Ground Height", default=core_sticks.DEFAULT_GROUND_EPSILON_M * 1000.0,
+        name="Ground Tolerance", default=core_sticks.DEFAULT_GROUND_EPSILON_M * 1000.0,
         min=0.0, max=10.0, precision=3,
-        description="A vertex at or below this height seats on the base plate",
+        description="A vertex within this distance of the build plate seats on it",
+    )
+    build_plate_height_mm: FloatProperty(
+        name="Build Plate Height", default=0.0,
+        min=0.0, max=1000.0, precision=1,
+        description="The physical build plate's own Z, in the selected robot's "
+                    "base frame. 0 (default) matches every design so far. The "
+                    "plate is height-adjustable, so a design that sits entirely "
+                    "above Z=0 -- reported as a floating component -- is not "
+                    "necessarily unbuildable, just unbuildable at the plate's "
+                    "CURRENT height here. Raise this to the component's own "
+                    "lowest point (named in the error) to treat it as resting "
+                    "on the plate",
     )
 
     # --- results ------------------------------------------------------------
@@ -235,6 +297,22 @@ class SO100SceneProps(PropertyGroup):
         name="Show Overlay", default=True,
         description="GPU viewport overlay: build volume + per-stick status colours "
                     "(Sec 10.4). Hard off switch -- kept in its own module",
+    )
+
+    # --- Phase E: robot mirror (Sec 10.4) -----------------------------------
+    show_mirror: BoolProperty(
+        name="Show Robot Mirror", default=False,
+        description="A rig posed by the vendored FK, showing the arm at the "
+                    "current build-order position -- a printer-style preview "
+                    "of the whole job before anything moves",
+    )
+    mirror_index: IntProperty(
+        default=0, min=0,
+        description="Position within the build order the mirror rig is posed at",
+    )
+    mirror_status: StringProperty(
+        default="", description="Which stick the mirror rig is showing, or why it "
+                                "isn't showing anything",
     )
 
     # --- Sec 6 / Phase C: build order --------------------------------------

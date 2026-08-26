@@ -9,8 +9,11 @@ elsewhere.
 Its A.1 design rules, and how they show up here:
 
 1. **Self-contained** -- no references back into the ``.blend``.
-2. **Already in robot coordinates** -- metres in ``base_link``. Blender does
-   the transform (``core/transform.py``); ROS2 does none.
+2. **Already in robot coordinates** -- metres, in the TARGET robot's own
+   root frame (``core_robots.RobotProfile.frame`` -- ``base_link`` for
+   so_arm_100, ``base`` for kr10_r900_2; see ``_frame_for_robot`` below,
+   not a single fixed name). Blender does the transform
+   (``core/transform.py``); ROS2 does none.
 3. **Ordered** -- the ``sticks`` array *is* the build order. ROS2 executes it
    as-is and never reorders. One authority, no drift.
 4. **Human-readable and diffable** -- pretty-printed, stable key order. Keys
@@ -28,13 +31,42 @@ import datetime
 import json
 import os
 
+from ..core import robots as core_robots
+
 BUILD_FORMAT = "so100_build"
 BUILD_VERSION = 1
 STATUS_FORMAT = "so100_build_status"
 STATUS_VERSION = 1
 
+# Historical default / fallback only -- see _frame_for_robot() below. A real
+# export always carries a real robot id and gets THAT robot's own frame
+# (core_robots.RobotProfile.frame), not this constant. Kept only for the
+# `robot=""` case a few unrelated tests use deliberately (see
+# tests/test_build_file.py).
 FRAME = "base_link"
 UNITS = "meters"
+
+
+def _frame_for_robot(robot):
+    """The frame this build file's coordinates are expressed in --
+    BRIDGE_PROTOCOL.md A.1 rule 2 ("already in robot coordinates... Blender
+    does the transform before writing") is a property of WHICH ROBOT, not
+    free-form per-export data, so this is intrinsic to the robot
+    (``core_robots.RobotProfile.frame``), never a flat constant. Found wrong
+    2026-08-23: a real kr10_r900_2 export carried the OLD flat ``FRAME``
+    constant's value (``"base_link"``, so_arm_100's own root link) instead
+    of kr10_r900_2's real root link (``"base"``) -- the executor
+    (``kuka_control/kuka_pick_and_place/build_file.py``) correctly refused
+    the file rather than silently using the wrong frame.
+
+    Falls back to the module-level ``FRAME`` default only when ``robot`` is
+    falsy -- a handful of tests exercise unrelated behaviour without
+    passing a robot id at all; a real export from ``ops/build.py`` always
+    passes ``props.robot_id``, a real, registered id.
+    """
+    if not robot:
+        return FRAME
+    return core_robots.get_robot(robot).frame
 
 # Coordinates are rounded to the micrometre before writing. Two reasons:
 # a diffable file should not churn on float noise, and the protocol's
@@ -122,7 +154,7 @@ def stick_entry(ordered, verdict=None):
     }
 
 
-def build_document(ordered_sticks, verdicts=None, source="",
+def build_document(ordered_sticks, verdicts=None, source="", robot="",
                    kinematics_version="", stock=None, build_volume=None,
                    generated=None):
     """Assemble the whole build file as a dict, per A.2.
@@ -131,6 +163,11 @@ def build_document(ordered_sticks, verdicts=None, source="",
     ``validation.buildable`` is false are **kept** -- A.2 requires them to
     appear so the operator sees the complete picture and can decide to build
     the rest.
+
+    ``robot`` is the BRIDGE_PROTOCOL.md Sec A.1.1 robot id this file was
+    validated and exported for (added 2026-08-21, multi-robot support) --
+    the executor must refuse to run a file whose ``robot`` doesn't match
+    itself, before even checking ``kinematics_version``.
     """
     verdicts = verdicts or {}
     stock = stock or {}
@@ -150,8 +187,9 @@ def build_document(ordered_sticks, verdicts=None, source="",
         "version": BUILD_VERSION,
         "generated": _timestamp(generated),
         "source": source,
-        "frame": FRAME,
+        "frame": _frame_for_robot(robot),
         "units": UNITS,
+        "robot": robot,
         "kinematics_version": kinematics_version,
         "stock": stock,
         "build_volume": build_volume,

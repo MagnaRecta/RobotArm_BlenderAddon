@@ -26,6 +26,7 @@ except ImportError:  # pragma: no cover -- bare CPython path
 
 if bpy is not None:
     import so100_builder
+    from so100_builder.core import order as core_order
     from so100_builder.core import state as core_state
     from so100_builder.ops.design import EDGE_ID_LAYER
 
@@ -94,7 +95,7 @@ class TestRegistration(BlenderTestCase):
 
     def test_panels_are_registered(self):
         self.assertIsNotNone(bpy.types.SO100_PT_design)
-        self.assertEqual(bpy.types.SO100_PT_design.bl_category, "SO-100")
+        self.assertEqual(bpy.types.SO100_PT_design.bl_category, "RA130")
 
 
 @unittest.skipIf(bpy is None, "requires Blender")
@@ -196,11 +197,17 @@ class TestWorldTransform(BlenderTestCase):
             self.assertAlmostEqual(item.stick_length_mm, 55.0, places=3)
 
     def test_scene_scale_length_is_applied(self):
-        # A millimetre-scale scene: the same numbers mean 1000x less.
-        bpy.context.scene.unit_settings.scale_length = 0.001
-        props = self.extract(min_stick_length_mm=0.066, max_stick_length_mm=1000.0)
+        # Halving the scene's unit scale halves the physical stick length.
+        # Deliberately mild (not an extreme scale like 0.001): the resulting
+        # 55mm stick stays above EVERY registered robot's own hard length
+        # floor (core_sticks.hard_min_stick_length_m(), now robot-aware --
+        # docs/STATUS.md 2026-08-23), so this test can exercise scale_length
+        # without also needing to fight that unrelated check via a
+        # min_stick_length_mm override.
+        bpy.context.scene.unit_settings.scale_length = 0.5
+        props = self.extract()
         for item in props.sticks:
-            self.assertAlmostEqual(item.stick_length_mm, 0.110, places=6)
+            self.assertAlmostEqual(item.stick_length_mm, 55.0, places=3)
 
     def test_rotated_base_empty_does_not_change_lengths(self):
         self.props.base_empty.rotation_euler = (0.3, -0.2, 1.1)
@@ -486,6 +493,147 @@ class TestBuildOrderOperator(BlenderTestCase):
         self.assertIn("floating_component", codes)
         self.assertTrue(any(entry.is_error for entry in props.order_warnings))
 
+    def test_raising_the_build_plate_grounds_a_previously_floating_component(self):
+        # A standalone stick sitting entirely above Z=0 (own lowest point at
+        # 100mm) -- not the ladder above, to avoid the ladder's own base
+        # (Z=0) ending up BELOW a raised plate and confusing the result.
+        # Raising the plate to meet it (2026-08-23: the plate is a real,
+        # height-adjustable object) makes it buildable through the full
+        # operator path, not just core/order.py directly.
+        mesh = bpy.data.meshes.new("Floating")
+        mesh.from_pydata([(0.0, CUBE_Y, 0.100), (0.0, CUBE_Y, 0.210)], [(0, 1)], [])
+        mesh.update()
+        self.design = bpy.data.objects.new("Floating", mesh)
+        bpy.context.collection.objects.link(self.design)
+        self.props.design_mesh = self.design
+
+        props = self._order()
+        codes = [entry.code for entry in props.order_warnings]
+        self.assertIn("floating_component", codes)
+
+        self.props.build_plate_height_mm = 100.0
+        props = self._order()
+        codes = [entry.code for entry in props.order_warnings]
+        self.assertNotIn("floating_component", codes)
+        self.assertTrue(props.has_order)
+        self.assertTrue(all(item.order >= 0 for item in props.sticks))
+
+    def test_unchecking_require_build_plate_orders_a_design_with_no_ground_at_all(self):
+        # 2026-08-23 user request: "I would put a stick's base... on shapes
+        # that are not a flat base" -- a design with NO vertex anywhere
+        # near a plausible plate height. Require Build Plate off makes it
+        # buildable through the full operator path (checkbox -> property ->
+        # both extraction and ordering agreeing on no ground check).
+        mesh = bpy.data.meshes.new("Floating")
+        mesh.from_pydata([(0.0, CUBE_Y, 0.100), (0.0, CUBE_Y, 0.210)], [(0, 1)], [])
+        mesh.update()
+        self.design = bpy.data.objects.new("Floating", mesh)
+        bpy.context.collection.objects.link(self.design)
+        self.props.design_mesh = self.design
+
+        self.props.require_build_plate = False
+        props = self._order()
+        codes = [entry.code for entry in props.order_warnings]
+        self.assertNotIn("floating_component", codes)
+        self.assertIn(core_order.WARN_NO_BUILD_PLATE, codes)
+        self.assertTrue(props.has_order)
+        self.assertTrue(all(item.order >= 0 for item in props.sticks))
+
+    def _use_two_independent_uprights(self):
+        # Two separately-grounded sticks with no dependency on each other --
+        # either can legally go first, so swapping them is always "safe".
+        mesh = bpy.data.meshes.new("TwoUprights")
+        mesh.from_pydata(
+            [(-0.05, CUBE_Y, 0.0), (-0.05, CUBE_Y, 0.110),
+             (0.05, CUBE_Y, 0.0), (0.05, CUBE_Y, 0.110)],
+            [(0, 1), (2, 3)], [])
+        mesh.update()
+        self.design = bpy.data.objects.new("TwoUprights", mesh)
+        bpy.context.collection.objects.link(self.design)
+        self.props.design_mesh = self.design
+
+    def _use_a_three_stick_chain(self):
+        # A straight vertical chain -- "b" needs "a"'s tip, "c" needs "b"'s
+        # tip -- so the automatic order is forced and unambiguous, and
+        # moving "c" before "b" is guaranteed to break its own support.
+        mesh = bpy.data.meshes.new("Chain")
+        mesh.from_pydata(
+            [(0.0, CUBE_Y, 0.0), (0.0, CUBE_Y, 0.110), (0.0, CUBE_Y, 0.220),
+             (0.0, CUBE_Y, 0.330)],
+            [(0, 1), (1, 2), (2, 3)], [])
+        mesh.update()
+        self.design = bpy.data.objects.new("Chain", mesh)
+        bpy.context.collection.objects.link(self.design)
+        self.props.design_mesh = self.design
+
+    def test_move_build_step_swaps_two_independent_sticks_cleanly(self):
+        self._use_two_independent_uprights()
+        props = self._order()
+        self.assertEqual(len(props.sticks), 2)
+        first_index = next(i for i, item in enumerate(props.sticks) if item.order == 0)
+        first_id, second_id = props.sticks[first_index].stick_id, None
+        for item in props.sticks:
+            if item.order == 1:
+                second_id = item.stick_id
+
+        props.active_stick_index = first_index
+        self.assertEqual(bpy.ops.so100.move_build_step(direction=1), {"FINISHED"})
+
+        by_id = {item.stick_id: item.order for item in props.sticks}
+        self.assertEqual(by_id[first_id], 1)
+        self.assertEqual(by_id[second_id], 0)
+        self.assertFalse(any(entry.is_error for entry in props.order_warnings))
+
+    def test_move_build_step_flags_a_move_that_breaks_support(self):
+        self._use_a_three_stick_chain()
+        props = self._order()
+        self.assertEqual(len(props.sticks), 3)
+        # "c" is whichever stick landed at build position 2 (the forced,
+        # unambiguous last position in a straight chain).
+        c_index = next(i for i, item in enumerate(props.sticks) if item.order == 2)
+        c_id = props.sticks[c_index].stick_id
+
+        props.active_stick_index = c_index
+        self.assertEqual(bpy.ops.so100.move_build_step(direction=-1), {"FINISHED"})
+
+        by_id = {item.stick_id: item.order for item in props.sticks}
+        self.assertEqual(by_id[c_id], 1)  # moved earlier, as asked
+        moved = next(item for item in props.sticks if item.stick_id == c_id)
+        self.assertEqual(moved.status, core_state.STATUS_IMPOSSIBLE)
+        self.assertTrue(moved.reason)
+        self.assertTrue(any(
+            entry.is_error and entry.stick_id == c_id for entry in props.order_warnings))
+
+    def test_move_build_step_at_the_start_of_the_order_is_a_no_op(self):
+        self._use_a_three_stick_chain()
+        props = self._order()
+        first_index = next(i for i, item in enumerate(props.sticks) if item.order == 0)
+        props.active_stick_index = first_index
+        self.assertEqual(bpy.ops.so100.move_build_step(direction=-1), {"CANCELLED"})
+        self.assertEqual(props.sticks[first_index].order, 0)
+
+    def test_poll_fails_without_an_active_stick_selected(self):
+        self._use_a_three_stick_chain()
+        self._order()
+        self.props.active_stick_index = -1
+        self.assertFalse(bpy.ops.so100.move_build_step.poll())
+
+    def test_export_respects_a_manual_reorder(self):
+        import tempfile
+
+        self._use_two_independent_uprights()
+        props = self._order()
+        first_index = next(i for i, item in enumerate(props.sticks) if item.order == 0)
+        props.active_stick_index = first_index
+        bpy.ops.so100.move_build_step(direction=1)
+        expected = [item.stick_id for item in sorted(props.sticks, key=lambda i: i.order)]
+
+        path = os.path.join(tempfile.mkdtemp(), "reordered.build.json")
+        self.assertEqual(bpy.ops.so100.export_build_file(filepath=path), {"FINISHED"})
+        with open(path) as handle:
+            document = json.loads(handle.read())
+        self.assertEqual([s["id"] for s in document["sticks"]], expected)
+
     def test_ordering_is_idempotent(self):
         first = [(i.stick_id, i.order) for i in self._order().sticks]
         second = [(i.stick_id, i.order) for i in self._order().sticks]
@@ -493,42 +641,401 @@ class TestBuildOrderOperator(BlenderTestCase):
 
 
 @unittest.skipIf(bpy is None, "requires Blender")
-class TestBuildOrderListSorting(unittest.TestCase):
-    """``filter_items`` wants "the new position OF item i", not a sorted
-    index list. Getting that backwards scrambles the list silently instead
-    of raising, so the permutation is checked directly."""
+class TestMirrorRig(BlenderTestCase):
+    """Phase E's robot mirror. BLENDER_ADDON_PLAN.md Sec 10.4: a rig posed
+    by the vendored FK, scrubbed through the build order."""
 
-    def test_already_ordered_is_the_identity(self):
-        from so100_builder.ui.panels import build_order_permutation
-        self.assertEqual(build_order_permutation([0, 1, 2]), [0, 1, 2])
+    def setUp(self):
+        bpy.ops.wm.read_factory_settings(use_empty=True)
+        self.props = bpy.context.scene.so100
+        # Same fully-buildable 3-level ladder as TestBuildOrderOperator --
+        # multi-layer, all-tangential horizontals.
+        half, length, gap = 0.055, 0.110, 0.0065
+        verts, edges = [], []
+        for level in range(3):
+            z = level * (length + gap)
+            verts.extend([(-half, CUBE_Y, z), (half, CUBE_Y, z)])
+        for level in range(2):
+            base = level * 2
+            edges.append((base, base + 2))
+            edges.append((base + 1, base + 3))
+        for level in range(1, 3):
+            base = level * 2
+            edges.append((base, base + 1))
+        mesh = bpy.data.meshes.new("Ladder")
+        mesh.from_pydata(verts, edges, [])
+        mesh.update()
+        self.design = bpy.data.objects.new("Ladder", mesh)
+        bpy.context.collection.objects.link(self.design)
+        bpy.ops.so100.create_base_empty()
+        self.props.design_mesh = self.design
+        self.props.ground_mode = "SLIDE"
+        self.assertEqual(bpy.ops.so100.compute_build_order(), {"FINISHED"})
 
-    def test_a_reversed_order_reverses_the_display(self):
-        from so100_builder.ui.panels import build_order_permutation
-        self.assertEqual(build_order_permutation([2, 1, 0]), [2, 1, 0])
+    def test_toggle_shows_and_hides_the_rig_object(self):
+        self.assertFalse(self.props.show_mirror)
+        self.assertEqual(bpy.ops.so100.mirror_toggle(), {"FINISHED"})
+        self.assertTrue(self.props.show_mirror)
+        obj = bpy.data.objects.get("SO100_Mirror")
+        self.assertIsNotNone(obj)
+        self.assertFalse(obj.hide_get())
+        self.assertEqual(len(obj.data.vertices), 6)
+        self.assertEqual(len(obj.data.edges), 5)
 
-    def test_it_is_a_true_permutation(self):
-        from so100_builder.ui.panels import build_order_permutation
-        orders = [3, 0, 4, 1, 2]
-        permutation = build_order_permutation(orders)
-        self.assertEqual(sorted(permutation), list(range(len(orders))))
+        bpy.ops.so100.mirror_toggle()
+        self.assertFalse(self.props.show_mirror)
+        self.assertTrue(bpy.data.objects.get("SO100_Mirror").hide_get())
 
-    def test_the_permutation_puts_each_item_at_its_build_index(self):
-        from so100_builder.ui.panels import build_order_permutation
-        orders = [3, 0, 4, 1, 2]
-        permutation = build_order_permutation(orders)
-        for item_index, build_index in enumerate(orders):
-            self.assertEqual(permutation[item_index], build_index)
+    def test_the_rig_is_never_selectable_or_rendered(self):
+        bpy.ops.so100.mirror_toggle()
+        obj = bpy.data.objects.get("SO100_Mirror")
+        self.assertTrue(obj.hide_select)
+        self.assertTrue(obj.hide_render)
 
-    def test_unordered_sticks_sort_last_keeping_relative_order(self):
-        from so100_builder.ui.panels import build_order_permutation
-        permutation = build_order_permutation([-1, 1, -1, 0])
-        # items 1 and 3 are ordered (build 1 and 0) -> display 1 and 0;
-        # items 0 and 2 are unordered -> display 2 and 3, in that order.
-        self.assertEqual(permutation, [2, 1, 3, 0])
+    def test_step_wraps_around_the_build_order(self):
+        bpy.ops.so100.mirror_toggle()
+        count = sum(1 for item in self.props.sticks if item.order >= 0)
+        self.props.mirror_index = count - 1
+        bpy.ops.so100.mirror_step(direction=1)
+        self.assertEqual(self.props.mirror_index, 0)
 
-    def test_an_empty_list_is_handled(self):
-        from so100_builder.ui.panels import build_order_permutation
-        self.assertEqual(build_order_permutation([]), [])
+        bpy.ops.so100.mirror_step(direction=-1)
+        self.assertEqual(self.props.mirror_index, count - 1)
+
+    def test_step_poll_fails_while_hidden(self):
+        self.assertFalse(self.props.show_mirror)
+        self.assertFalse(bpy.ops.so100.mirror_step.poll())
+
+    def test_status_names_the_stick_and_its_position(self):
+        bpy.ops.so100.mirror_toggle()
+        self.assertRegex(self.props.mirror_status, r"^s_\d+ -- build order 1 of \d+$")
+
+    def test_the_last_segment_ends_near_the_stick_grasp_target(self):
+        # Sanity check that the rig is actually posed AT the stick, not
+        # just drawing something -- the TCP (last point) should sit within
+        # a few mm of the stick's own grasp target.
+        from so100_builder.core import transform as core_transform
+        from so100_builder.kinematics.so_arm_100 import grasp as kgrasp
+
+        bpy.ops.so100.mirror_toggle()
+        ordered = sorted((i for i in self.props.sticks if i.order >= 0),
+                         key=lambda i: i.order)
+        item = ordered[0]
+        edge_index = next(i for i, s in enumerate(self.props.sticks)
+                          if s.stick_id == item.stick_id)
+        build_edge = self.props.build_mesh.data.edges[edge_index]
+        scale_length = bpy.context.scene.unit_settings.scale_length
+        base_matrix = core_transform.to_tuple_4x4(self.props.base_empty.matrix_world)
+        a = core_transform.blender_to_robot(
+            tuple(self.props.build_mesh.data.vertices[build_edge.vertices[0]].co),
+            base_matrix, scale_length,
+        )
+        b = core_transform.blender_to_robot(
+            tuple(self.props.build_mesh.data.vertices[build_edge.vertices[1]].co),
+            base_matrix, scale_length,
+        )
+        expected_target = kgrasp.grasp_target(a, b)
+        expected_blender = core_transform.robot_to_blender(
+            expected_target, base_matrix, scale_length
+        )
+
+        rig = bpy.data.objects.get("SO100_Mirror")
+        tcp = tuple(rig.data.vertices[-1].co)
+        for got, want in zip(tcp, expected_blender):
+            self.assertAlmostEqual(got, want, delta=0.001)
+
+    def test_unregister_removes_the_rig_object(self):
+        bpy.ops.so100.mirror_toggle()
+        self.assertIsNotNone(bpy.data.objects.get("SO100_Mirror"))
+        so100_builder.unregister()
+        self.assertIsNone(bpy.data.objects.get("SO100_Mirror"))
+        so100_builder.register()  # tearDownClass expects it still registered
+
+    def test_kr10_mirror_rig_uses_kr10s_own_kinematics_not_so_arm_100s(self):
+        # kr10_r900_2_kinematics was vendored 2026-08-22 (kuka_control) --
+        # switching robot_id must actually run ITS fk()/solve, never
+        # so_arm_100's geometry and never the pre-vendoring "not vendored"
+        # message. The ladder fixture sits at so_arm_100's usual build
+        # position, which this very different 6-DOF arm may or may not
+        # reach -- either outcome is fine here, "not vendored" is not.
+        self.props.robot_id = "kr10_r900_2"
+        self.assertEqual(bpy.ops.so100.mirror_toggle(), {"FINISHED"})
+        self.assertNotIn("not vendored", self.props.mirror_status)
+        obj = bpy.data.objects.get("SO100_Mirror")
+        if not obj.hide_get():
+            # Posed: 6 joints -> 7 points -> 6 segments (core/mirror.py is
+            # robot-agnostic on joint count), not so_arm_100's 6 points/5
+            # segments -- confirms this isn't just reusing the 5-DOF shape.
+            self.assertEqual(len(obj.data.vertices), 7)
+            self.assertEqual(len(obj.data.edges), 6)
+
+
+@unittest.skipIf(bpy is None, "requires Blender")
+class TestMultiRobot(BlenderTestCase):
+    """docs/STATUS.md "Multi-robot support kicked off 2026-08-21", both
+    robots' kinematics vendored (so_arm_100 from the start, kr10_r900_2
+    2026-08-22). Confirms robot_id actually selects real, different
+    kinematics rather than a stub or a silent fall-through to so_arm_100's
+    geometry."""
+
+    def test_default_robot_id_is_so_arm_100(self):
+        self.assertEqual(self.props.robot_id, "so_arm_100")
+
+    def test_create_base_empty_names_it_per_selected_robot(self):
+        # Previously always "SO100_Base" regardless of robot_id -- the addon
+        # had no way to create a KUKA base at all (docs/STATUS.md 2026-08-22).
+        bpy.ops.wm.read_factory_settings(use_empty=True)
+        props = bpy.context.scene.so100
+        props.robot_id = "kr10_r900_2"
+        self.assertEqual(bpy.ops.so100.create_base_empty(), {"FINISHED"})
+        self.assertIsNotNone(props.base_empty)
+        self.assertEqual(props.base_empty.name, "KR10_Base")
+        self.assertIn(props.base_empty.name, bpy.data.objects)
+
+    def test_create_base_empty_still_names_it_so100_base_by_default(self):
+        # so_arm_100's own path must stay byte-for-byte unchanged.
+        bpy.ops.wm.read_factory_settings(use_empty=True)
+        props = bpy.context.scene.so100
+        self.assertEqual(bpy.ops.so100.create_base_empty(), {"FINISHED"})
+        self.assertEqual(props.base_empty.name, "SO100_Base")
+
+    def test_build_mesh_is_named_per_selected_robot(self):
+        # Previously always "SO100_BuildMesh" regardless of robot_id
+        # (docs/STATUS.md 2026-08-23).
+        props = self.extract(robot_id="kr10_r900_2", ground_mode="SLIDE")
+        self.assertEqual(props.build_mesh.name, "KR10_BuildMesh")
+
+    def test_build_mesh_still_named_so100_buildmesh_by_default(self):
+        props = self.extract(ground_mode="SLIDE")
+        self.assertEqual(props.build_mesh.name, "SO100_BuildMesh")
+
+    def test_reset_stock_to_robot_defaults_uses_kr10s_own_numbers(self):
+        from so100_builder.core import robots as core_robots
+
+        props = self.props
+        props.robot_id = "kr10_r900_2"
+        self.assertEqual(bpy.ops.so100.reset_stock_to_robot_defaults(), {"FINISHED"})
+        kinematics = core_robots.get_robot("kr10_r900_2").kinematics
+        # section_mm/joint_allowance_mm are the UI ergonomics overrides
+        # (2mm / 1.5mm), not kinematics.STICK_SECTION_M/JOINT_ALLOWANCE_M
+        # directly -- see _STOCK_DEFAULT_OVERRIDES_MM in ops/design.py.
+        self.assertAlmostEqual(props.section_mm, 2.0, places=6)
+        self.assertAlmostEqual(props.joint_allowance_mm, 1.5, places=6)
+        self.assertAlmostEqual(
+            props.min_stick_length_mm, kinematics.STICK_LENGTH_RANGE_M[0] * 1000.0, places=6)
+        self.assertAlmostEqual(
+            props.max_stick_length_mm, kinematics.STICK_LENGTH_RANGE_M[1] * 1000.0, places=6)
+
+    def test_reset_stock_to_robot_defaults_uses_so_arm_100s_own_numbers(self):
+        from so100_builder.core import robots as core_robots
+
+        self.assertEqual(bpy.ops.so100.reset_stock_to_robot_defaults(), {"FINISHED"})
+        kinematics = core_robots.get_robot("so_arm_100").kinematics
+        self.assertAlmostEqual(self.props.section_mm, kinematics.STICK_SECTION_M * 1000.0,
+                               places=6)
+
+    def test_kr10_validation_runs_for_real_without_crashing(self):
+        # Real per-stick verdicts against kr10_r900_2's own kinematics --
+        # never a crash, and never the pre-vendoring "not vendored" text.
+        props = self.extract(robot_id="kr10_r900_2")
+        self.assertGreater(len(props.sticks), 0)
+        for item in props.sticks:
+            self.assertIn(
+                item.status, (core_state.STATUS_BUILDABLE, core_state.STATUS_IMPOSSIBLE))
+            if item.status == core_state.STATUS_IMPOSSIBLE:
+                self.assertNotIn("not vendored", item.reason)
+
+    def test_so_arm_100_extraction_is_unaffected_by_the_registry(self):
+        # The default path must stay byte-for-byte what it was before
+        # multi-robot support -- same fixture, same shape of outcome as
+        # TestExtraction's own cube (some sticks buildable, some genuinely
+        # impossible for kinematic reasons unrelated to the robot registry).
+        props = self.extract(ground_mode="SLIDE")
+        self.assertEqual(len(props.sticks), 12)
+        buildable = sum(1 for i in props.sticks
+                        if i.status == core_state.STATUS_BUILDABLE)
+        impossible = sum(1 for i in props.sticks
+                         if i.status == core_state.STATUS_IMPOSSIBLE)
+        self.assertEqual(buildable + impossible, 12)
+        self.assertGreater(buildable, 0)
+
+    def test_kr10_has_a_confirmed_build_volume_and_is_vendored(self):
+        from so100_builder.core import robots as core_robots
+        profile = core_robots.get_robot("kr10_r900_2")
+        self.assertTrue(profile.has_build_volume)
+        self.assertTrue(profile.is_vendored)
+
+    def test_export_stamps_the_selected_robot_and_its_kinematics_version(self):
+        import tempfile
+        from so100_builder.core import robots as core_robots
+
+        self.extract(robot_id="kr10_r900_2", ground_mode="SLIDE")
+        path = os.path.join(tempfile.mkdtemp(), "kuka.build.json")
+        result = bpy.ops.so100.export_build_file(filepath=path)
+        self.assertEqual(result, {"FINISHED"})
+        with open(path) as handle:
+            document = json.loads(handle.read())
+        self.assertEqual(document["robot"], "kr10_r900_2")
+        self.assertEqual(
+            document["kinematics_version"],
+            core_robots.get_robot("kr10_r900_2").kinematics.__version__,
+        )
+        self.assertEqual(document["build_volume"]["min"], [0.3, -0.15, -0.02])
+        self.assertEqual(document["build_volume"]["max"], [0.6, 0.15, 0.28])
+
+    def test_compute_build_order_works_for_a_kr10_only_design(self):
+        # Regression test for the reported bug: every reachability check
+        # inside core/order.py's solver used to run so_arm_100's own
+        # kinematics regardless of robot_id, so a design sitting well
+        # within kr10_r900_2's own build zone but past so_arm_100's much
+        # smaller documented reach (max validated Y -450mm) would report
+        # "0 in order ... 1 error" with no clue the wrong robot was being
+        # checked. Y=-550mm is deep in kr10_r900_2's own zone
+        # ([-600,-300]mm) and clearly outside so_arm_100's.
+        bpy.ops.wm.read_factory_settings(use_empty=True)
+        props = bpy.context.scene.so100
+        half, length, gap, y = 0.055, 0.110, 0.0065, -0.550
+        verts, edges = [], []
+        for level in range(3):
+            z = level * (length + gap)
+            verts.extend([(-half, y, z), (half, y, z)])
+        for level in range(2):
+            base = level * 2
+            edges.append((base, base + 2))
+            edges.append((base + 1, base + 3))
+        for level in range(1, 3):
+            base = level * 2
+            edges.append((base, base + 1))
+        mesh = bpy.data.meshes.new("KukaLadder")
+        mesh.from_pydata(verts, edges, [])
+        mesh.update()
+        design = bpy.data.objects.new("KukaLadder", mesh)
+        bpy.context.collection.objects.link(design)
+        props.robot_id = "kr10_r900_2"
+        bpy.ops.so100.create_base_empty()
+        props.design_mesh = design
+        props.ground_mode = "SLIDE"
+
+        self.assertEqual(bpy.ops.so100.compute_build_order(), {"FINISHED"})
+        self.assertTrue(props.has_order)
+        self.assertGreater(len(props.sticks), 0)
+        for item in props.sticks:
+            self.assertGreaterEqual(item.order, 0, item.reason)
+
+
+@unittest.skipIf(bpy is None, "requires Blender")
+class TestTranslations(BlenderTestCase):
+    """i18n.py -- 2026-08-24 user request: "is it possible to add a second
+    language to the addon GUI?". Registered once for real via
+    ``so100_builder.register()`` (``BlenderTestCase``'s own setUp), so this
+    exercises the actual dict handed to ``bpy.app.translations.register()``,
+    not a copy -- a typo in a msgctxt or a source string that has drifted
+    from the real code would otherwise pass silently."""
+
+    def setUp(self):
+        super().setUp()
+        self._language = bpy.context.preferences.view.language
+        self._use_interface = bpy.context.preferences.view.use_translate_interface
+        self._use_tooltips = bpy.context.preferences.view.use_translate_tooltips
+
+    def tearDown(self):
+        # Preferences are process-global, not per-scene -- must not leak
+        # into whichever test class runs next in the same process.
+        bpy.context.preferences.view.language = self._language
+        bpy.context.preferences.view.use_translate_interface = self._use_interface
+        bpy.context.preferences.view.use_translate_tooltips = self._use_tooltips
+
+    def _use_japanese(self):
+        bpy.context.preferences.view.language = "ja_JP"
+        bpy.context.preferences.view.use_translate_interface = True
+        bpy.context.preferences.view.use_translate_tooltips = True
+
+    def test_a_panel_title_translates_to_japanese(self):
+        self._use_japanese()
+        self.assertEqual(bpy.app.translations.pgettext_iface("Design"), "デザイン")
+
+    def test_an_operator_label_translates_to_japanese(self):
+        self._use_japanese()
+        translated = bpy.app.translations.pgettext(
+            "Extract Sticks", bpy.app.translations.contexts.operator_default)
+        self.assertEqual(translated, "スティックを抽出")
+
+    def test_a_property_name_translates_to_japanese(self):
+        self._use_japanese()
+        self.assertEqual(
+            bpy.app.translations.pgettext_iface("Joint Allowance"), "ジョイント許容量")
+
+    def test_nothing_translates_when_language_stays_english(self):
+        bpy.context.preferences.view.language = "en_US"
+        self.assertEqual(bpy.app.translations.pgettext_iface("Design"), "Design")
+
+    def test_a_sample_of_operator_labels_matches_the_real_registered_ones(self):
+        # Not exhaustive (bl_rna.name is the CLASS IDENTIFIER for an
+        # Operator, not its label -- confirmed directly; only bl_label is)
+        # -- a spot check across several real operators that a rename in
+        # ops/*.py without a matching i18n.py update would catch, without
+        # the much larger machinery an exhaustive check over every
+        # label/description/nested-property/enum-item would need.
+        from so100_builder import i18n as i18n_module
+
+        op_ctx = bpy.app.translations.contexts.operator_default
+        for idname in ("SO100_OT_extract_sticks", "SO100_OT_compute_build_order",
+                      "SO100_OT_move_build_step", "SO100_OT_export_build_file",
+                      "SO100_OT_create_base_empty"):
+            label = getattr(bpy.types, idname).bl_label
+            self.assertIn((op_ctx, label), i18n_module._JA, idname)
+
+
+@unittest.skipIf(bpy is None, "requires Blender")
+class TestOverlayBuildVolume(unittest.TestCase):
+    """ui/overlay.py's build-volume box, previously always so_arm_100's
+    regardless of robot_id (docs/STATUS.md 2026-08-23). ``_volume_box_points``
+    is pure geometry (no gpu calls), so -- unlike the rest of this module,
+    which needs a real GPU context the module's own docstring says
+    ``--background`` cannot provide -- it's directly testable here."""
+
+    IDENTITY = ((1.0, 0.0, 0.0, 0.0), (0.0, 1.0, 0.0, 0.0),
+               (0.0, 0.0, 1.0, 0.0), (0.0, 0.0, 0.0, 1.0))
+
+    def _bounds(self, points):
+        lo = [min(p[i] for p in points) for i in range(3)]
+        hi = [max(p[i] for p in points) for i in range(3)]
+        return lo, hi
+
+    def test_so_arm_100_box_matches_its_own_profile(self):
+        from so100_builder.core import robots as core_robots
+        from so100_builder.ui.overlay import _volume_box_points
+
+        points = _volume_box_points(self.IDENTITY, 1.0, "so_arm_100")
+        self.assertEqual(len(points), 24)  # 12 edges x 2 endpoints
+        lo, hi = self._bounds(points)
+        profile = core_robots.get_robot("so_arm_100")
+        for got, want in zip(lo, profile.build_volume_min_m):
+            self.assertAlmostEqual(got, want, places=9)
+        for got, want in zip(hi, profile.build_volume_max_m):
+            self.assertAlmostEqual(got, want, places=9)
+
+    def test_kr10_box_is_the_real_300mm_cube_not_so_arm_100s(self):
+        from so100_builder.ui.overlay import _volume_box_points
+
+        points = _volume_box_points(self.IDENTITY, 1.0, "kr10_r900_2")
+        lo, hi = self._bounds(points)
+        self.assertEqual([round(v, 6) for v in lo], [0.3, -0.15, -0.02])
+        self.assertEqual([round(v, 6) for v in hi], [0.6, 0.15, 0.28])
+
+    def test_kr10_base_box_sits_below_the_robot_origin(self):
+        from so100_builder.ui.overlay import _base_box_points
+
+        points = _base_box_points(self.IDENTITY, 1.0, "kr10_r900_2")
+        self.assertEqual(len(points), 24)  # 12 edges x 2 endpoints
+        lo, hi = self._bounds(points)
+        self.assertEqual([round(v, 6) for v in lo], [-0.16, -0.16, -0.02])
+        self.assertEqual([round(v, 6) for v in hi], [0.16, 0.16, 0.0])
+
+    def test_so_arm_100_has_no_base_box_to_draw(self):
+        from so100_builder.ui.overlay import _base_box_points
+
+        self.assertEqual(_base_box_points(self.IDENTITY, 1.0, "so_arm_100"), [])
 
 
 @unittest.skipIf(bpy is None, "requires Blender")
@@ -573,6 +1080,34 @@ class TestSelectStickInViewport(BlenderTestCase):
         bpy.ops.so100.step_stick(direction=-1)
         self.assertEqual(self.props.active_stick_index, len(props.sticks) - 1)
         bpy.ops.object.mode_set(mode="OBJECT")
+
+    def test_step_stick_follows_build_order_once_one_exists(self):
+        # 2026-08-23, user-reported: stepping followed the raw extraction/
+        # edge index, not the order the robot actually builds in -- the two
+        # differ as soon as a build order is computed (the cube's top ring
+        # can only be placed after its bottom ring, regardless of which
+        # edge id either got at extraction).
+        from so100_builder.core import state as core_state
+
+        props = self.extract(ground_mode="SLIDE")
+        self.assertEqual(bpy.ops.so100.compute_build_order(), {"FINISHED"})
+
+        count = len(props.sticks)
+        permutation = core_state.build_order_permutation(
+            [item.order for item in props.sticks])
+        inverse = [0] * count
+        for original_index, position in enumerate(permutation):
+            inverse[position] = original_index
+        # The fixture actually has to exercise the bug: if build order
+        # happened to match extraction order exactly, stepping by raw
+        # index would look identical to stepping by build order too.
+        self.assertNotEqual(inverse, list(range(count)))
+
+        props.active_stick_index = inverse[0]
+        for build_position in range(1, count):
+            bpy.ops.so100.step_stick(direction=1)
+            bpy.ops.object.mode_set(mode="OBJECT")
+            self.assertEqual(self.props.active_stick_index, inverse[build_position])
 
     def test_out_of_sync_build_mesh_is_a_clean_error(self):
         # A stick was added/removed since the build mesh was generated --
@@ -653,7 +1188,14 @@ class TestBuildFileExportAndResume(BlenderTestCase):
         # here would strand the operator.
         import so100_builder
         self.assertEqual(self._export()["kinematics_version"],
-                         so100_builder.kinematics.__version__)
+                         so100_builder.kinematics.so_arm_100.__version__)
+
+    def test_the_robot_id_is_stamped(self):
+        # BRIDGE_PROTOCOL.md Sec A.1.1 (added 2026-08-21): the executor
+        # refuses to run a file meant for a different robot, so this has to
+        # be the id actually selected -- default is so_arm_100.
+        self.assertEqual(self.props.robot_id, "so_arm_100")
+        self.assertEqual(self._export()["robot"], "so_arm_100")
 
     def test_stock_and_build_volume_are_included(self):
         document = self._export()

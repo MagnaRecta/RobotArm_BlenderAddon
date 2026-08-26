@@ -1,43 +1,22 @@
-"""Closed-form FK/IK for the SO-100 5-DOF arm.
+"""Vendored kinematics packages -- one sub-package per supported robot.
 
-Pure Python, stdlib only (``math``), zero ROS imports -- this package is
-vendored verbatim into the Blender addon and must run unmodified in
-Blender's bundled interpreter. See README.md before copying it anywhere.
+This directory holds a verbatim copy of each robot's own pure-Python
+kinematics package (BLENDER_ADDON_PLAN.md Sec 4, "the kinematics/ folder is
+a verbatim copy, never a fork"), one sub-directory per BRIDGE_PROTOCOL.md
+Sec A.1.1 robot id:
+
+    kinematics/
+    +-- so_arm_100/    vendored from so_arm_100_kinematics -- hardware-validated
+    +-- kr10_r900_2/   placeholder -- kr10_r900_2_kinematics does not exist yet
+
+Neither this package nor its sub-packages know how to pick one for a given
+design; that is ``core/robots.py``'s job (the registry + the interface
+contract every one of these sub-packages must satisfy). Import a specific
+robot's package directly (``from .so_arm_100 import constants``) or, for
+robot-agnostic code, go through ``core.robots.get_robot(robot_id).kinematics``.
+
+Adding a third robot means: a new sub-directory here (vendored per that
+package's own README, same rules as ``so_arm_100_kinematics``'s), a new
+``RobotProfile`` entry in ``core/robots.py``, and a new row in
+BRIDGE_PROTOCOL.md Sec A.1.1's table. Nothing else in this directory changes.
 """
-
-# Bump on ANY change to chain.py or constants.py that alters computed
-# results. Written into every build file as `kinematics_version` so a
-# Blender-side copy that has drifted from the robot-side original is caught
-# loudly at load time rather than silently producing wrong placements.
-# Must match the VERSION file at this package's root.
-__version__ = "1.0.0"
-
-from .chain import Unreachable, fk, ik, tool_axis, tool_elevation_rad
-from .constants import (
-    BUILD_VOLUME_MAX_M,
-    BUILD_VOLUME_MIN_M,
-    GRASP_OFFSET_M,
-    JOINT_ALLOWANCE_M,
-    JOINT_NAMES,
-    STICK_LENGTH_RANGE_M,
-    STICK_SECTION_M,
-)
-from .envelope import is_reachable, sweep_envelope
-
-__all__ = [
-    "__version__",
-    "fk",
-    "ik",
-    "Unreachable",
-    "tool_axis",
-    "tool_elevation_rad",
-    "is_reachable",
-    "sweep_envelope",
-    "JOINT_NAMES",
-    "GRASP_OFFSET_M",
-    "STICK_SECTION_M",
-    "STICK_LENGTH_RANGE_M",
-    "JOINT_ALLOWANCE_M",
-    "BUILD_VOLUME_MIN_M",
-    "BUILD_VOLUME_MAX_M",
-]

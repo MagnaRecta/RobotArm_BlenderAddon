@@ -43,6 +43,7 @@ def exported(design=None, **kwargs):
     design = design if design is not None else stack()
     order_result = core_order.compute_order(design.sticks)
     verdicts = core_validate.validate_sticks(design.sticks)
+    kwargs.setdefault("robot", "so_arm_100")
     kwargs.setdefault("kinematics_version", "1.0.0")
     kwargs.setdefault("source", "test.blend")
     return BF.build_document(order_result.ordered, verdicts, **kwargs)
@@ -56,8 +57,23 @@ class TestDocumentShape(unittest.TestCase):
         self.assertEqual(
             list(exported().keys()),
             ["format", "version", "generated", "source", "frame", "units",
-             "kinematics_version", "stock", "build_volume", "sticks"],
+             "robot", "kinematics_version", "stock", "build_volume", "sticks"],
         )
+
+    def test_robot_id_is_written(self):
+        # A.1.1 (added 2026-08-21): the executor refuses to run a file for
+        # the wrong robot, before even checking kinematics_version.
+        self.assertEqual(exported(robot="kr10_r900_2")["robot"], "kr10_r900_2")
+
+    def test_frame_is_the_target_robots_own_root_link(self):
+        # Regression for a real bug found 2026-08-23: a kr10_r900_2 export
+        # carried the flat FRAME constant's value ("base_link", so_arm_100's
+        # own root link) instead of kr10_r900_2's real root link ("base") --
+        # the executor correctly refused the file. frame must now come from
+        # core_robots.get_robot(robot).frame, per-robot, not a single
+        # constant -- so_arm_100 and kr10_r900_2 must disagree here.
+        self.assertEqual(exported(robot="so_arm_100")["frame"], "base_link")
+        self.assertEqual(exported(robot="kr10_r900_2")["frame"], "base")
 
     def test_stick_keys_match_the_protocol_in_order(self):
         self.assertEqual(

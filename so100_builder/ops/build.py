@@ -21,12 +21,11 @@ from bpy.props import EnumProperty, StringProperty
 from bpy.types import Operator
 from bpy_extras.io_utils import ExportHelper, ImportHelper
 
-from .. import kinematics
+from ..core import robots as core_robots
 from ..core import state as core_state
 from ..core import transform as core_transform
 from ..io import build_file as build_io
-from ..kinematics import constants as kc
-from .design import check_design_ready, rebuild_build_mesh, store_results
+from .design import check_design_ready, ordered_ids, rebuild_build_mesh, store_results
 from .order import build_solver  # the same pipeline, so export cannot drift
 
 
@@ -52,10 +51,15 @@ def _stock_block(props):
     }
 
 
-def _build_volume_block():
+def _build_volume_block(profile):
+    """``None`` when this robot's build volume isn't confirmed yet
+    (``core/robots.py``'s ``RobotProfile.has_build_volume``) -- callers must
+    check for that rather than write a made-up box into the file."""
+    if not profile.has_build_volume:
+        return None
     return {
-        "min": list(kc.BUILD_VOLUME_MIN_M),
-        "max": list(kc.BUILD_VOLUME_MAX_M),
+        "min": list(profile.build_volume_min_m),
+        "max": list(profile.build_volume_max_m),
     }
 
 
@@ -70,13 +74,6 @@ def collect_statuses(props):
             "reason": item.reason,
         }
     return statuses
-
-
-def ordered_ids(props):
-    """Stick ids in build order. Empty when no order has been computed."""
-    ordered = [item for item in props.sticks if item.order >= 0]
-    ordered.sort(key=lambda item: item.order)
-    return [item.stick_id for item in ordered]
 
 
 def write_status_sidecar(props, current_index=0):
@@ -114,11 +111,46 @@ class SO100_OT_export_build_file(Operator, ExportHelper):
         if problem:
             return _report_error(self, problem)
 
+        profile = core_robots.get_robot(props.robot_id)
+        # Two independent facts (core/robots.py's module docstring): knowing
+        # WHERE a robot may build is not the same as being able to compute
+        # WHETHER a given placement is reachable there. Check both, with
+        # distinct messages, rather than conflating them into one guess.
+        if not profile.is_vendored:
+            return _report_error(
+                self,
+                "Robot %r's kinematics package is not vendored into this "
+                "addon yet -- cannot export a build file until it is"
+                % props.robot_id,
+            )
+        build_volume = _build_volume_block(profile)
+        if build_volume is None:
+            # BRIDGE_PROTOCOL.md Sec A.1.1: a robot's own geometric constants
+            # are that robot's kinematics package's business, never invented
+            # here (core/robots.py's module docstring) -- refuse rather than
+            # export a build file with a made-up build_volume.
+            return _report_error(
+                self,
+                "Robot %r has no confirmed build volume yet -- cannot export "
+                "a build file until its kinematics package provides one"
+                % props.robot_id,
+            )
+
         try:
             solver, (result, verdicts, auto_flipped) = build_solver(context, props)
         except (ValueError, core_transform.SingularMatrix) as exc:
             return _report_error(self, str(exc))
-        order_result = solver.solve()
+
+        if props.has_order:
+            # A build order already exists -- possibly with the user's own
+            # manual reordering (SO100_OT_move_build_step, 2026-08-23)
+            # layered on top of the last automatic solve. Replay it
+            # verbatim rather than silently re-solving from scratch and
+            # discarding that work; solve() (a fresh automatic search) only
+            # runs the first time, before any order exists yet.
+            order_result = solver.replay(ordered_ids(props))
+        else:
+            order_result = solver.solve()
 
         if not order_result.ordered:
             return _report_error(
@@ -134,9 +166,10 @@ class SO100_OT_export_build_file(Operator, ExportHelper):
             order_result.ordered,
             verdicts,
             source=os.path.basename(bpy.data.filepath) or "(unsaved.blend)",
-            kinematics_version=kinematics.__version__,
+            robot=profile.id,
+            kinematics_version=profile.kinematics.__version__,
             stock=_stock_block(props),
-            build_volume=_build_volume_block(),
+            build_volume=build_volume,
         )
 
         try:

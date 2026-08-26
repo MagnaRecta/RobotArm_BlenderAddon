@@ -80,6 +80,31 @@ def allocate_ids(edge_id_numbers, next_number):
     return assigned, next_number, reassigned
 
 
+def build_order_permutation(orders):
+    """``[build_order_per_item] -> [display_position_per_item]``.
+
+    Blender's ``filter_items`` wants a permutation in that direction (the
+    new position *of* item i), not a sorted index list -- getting it
+    backwards silently scrambles the list rather than erroring, so this is
+    split out to be unit-testable without a running UI. Also used directly
+    by ``ops/design.py``'s Check By Eye stepping, to walk BUILD order rather
+    than the underlying collection's own extraction order (2026-08-23,
+    user-reported: stepping followed edge/extraction order, not the order
+    the robot actually builds in).
+
+    Unordered sticks (``order == -1``) sort last, keeping their relative
+    order, so a partial solve still reads sensibly.
+    """
+    ranked = sorted(
+        range(len(orders)),
+        key=lambda i: (orders[i] < 0, orders[i] if orders[i] >= 0 else i),
+    )
+    permutation = [0] * len(orders)
+    for position, original_index in enumerate(ranked):
+        permutation[original_index] = position
+    return permutation
+
+
 def topology_signature(edge_ids, stick_lengths_m, places=4):
     """A cheap fingerprint of "the design the order was computed against".
 

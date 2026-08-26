@@ -40,14 +40,51 @@ JOINT_NAMES = tuple(entry[0] for entry in CHAIN)
 # confirmed with a ruler. See ROS2_IMPLEMENTATION_PLAN.md N3/Phase 0.
 GRASP_OFFSET_M = 0.051
 
+# Half the jaws' thickness ALONG THE STICK'S OWN AXIS (10mm total, per the
+# user's own measurement) -- how much stick length the closed jaws actually
+# cover, centred on the grasp offset. Distinct from JAW_RADIUS_M below,
+# which is the jaws' RADIAL extent around the tool axis (for neighbour-stick
+# clearance) -- do not conflate the two. Used by grasp.grasp_offset_for_length
+# to cap the offset so the jaws never close past a short stick's tip: e.g. a
+# 50mm stick's ceiling is 50mm - 5mm = 45mm, matching that measurement.
+JAW_CONTACT_HALF_LENGTH_M = 0.005
+
+# Floor-clearance floor for grasp.grasp_offset_for_length: the grip offset is
+# measured UP from the stick's base, so a SMALLER offset means the jaws sit
+# CLOSER to the feeder floor -- this is the minimum offset trusted before the
+# jaws risk hitting the feeder mechanism. Placeholder, same unmeasured status
+# as GRASP_OFFSET_M above -- chosen low enough that it does not actually bind
+# anywhere in STICK_LENGTH_RANGE_M below (the 50mm case computes to 45mm), it
+# is purely a backstop against a future config change lowering the minimum
+# stick length further without deliberately re-measuring this. Confirm on
+# hardware (jog the computed `lower` pose in RViz's Joints tab, or preview it
+# via display_planned_path) before trusting it for a real short stick.
+MIN_GRASP_OFFSET_M = 0.030
+
 STICK_SECTION_M = 0.00645  # square stock, both dimensions
-STICK_LENGTH_RANGE_M = (0.080, 0.150)  # ROS2_IMPLEMENTATION_PLAN.md N3
+STICK_LENGTH_RANGE_M = (0.050, 0.150)  # ROS2_IMPLEMENTATION_PLAN.md N3/D13
 JOINT_ALLOWANCE_M = 0.00325  # ROS2_IMPLEMENTATION_PLAN.md N4 / §8.4
 
 # --- Build volume (base_link frame) -----------------------------------------
 # ROS2_IMPLEMENTATION_PLAN.md N2: 240 x 160 x 200 mm centred at Y=-370mm.
 BUILD_VOLUME_MIN_M = (-0.12, -0.45, 0.0)
 BUILD_VOLUME_MAX_M = (0.12, -0.29, 0.20)
+
+# --- Jaw clearance (Sec 8.2 consequence 2) ----------------------------------
+# The jaws close ~GRASP_OFFSET_M above the stick's base end -- right where the
+# glue joint and any already-placed neighbour sticks are. Modelled as a
+# capsule (radius JAW_RADIUS_M) spanning grip point -> base vertex, per
+# jaw_clearance.py's module docstring. NOT yet measured with calipers -- a
+# placeholder in the same spirit as GRASP_OFFSET_M. See
+# ROS2_IMPLEMENTATION_PLAN.md Sec 8.2/Sec 11 Phase 0.
+JAW_RADIUS_M = 0.010  # "~20 mm across" (Sec 8.2) -> ~10 mm from the tool axis
+
+# Already-placed sticks are checked as capsules too: circumscribed radius of
+# the square stock (half the diagonal, so a corner-on collision is still
+# caught) plus a small inflation so plans do not graze fresh glue (Sec 10's
+# own "consider 1-2 mm inflation" note).
+STICK_COLLISION_INFLATION_M = 0.0015
+STICK_COLLISION_RADIUS_M = STICK_SECTION_M * (2.0 ** 0.5) / 2.0 + STICK_COLLISION_INFLATION_M
 
 # --- Roll convention ---------------------------------------------------------
 # All five tuned example poses in pick_and_place.yaml use Wrist_Roll = 90 deg

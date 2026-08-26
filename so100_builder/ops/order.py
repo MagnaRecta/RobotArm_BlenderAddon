@@ -18,6 +18,7 @@ Both paths share ``_prepare`` and ``_finish`` so the two cannot drift.
 """
 
 import bpy
+from bpy.props import IntProperty
 from bpy.types import Operator
 
 from ..core import order as core_order
@@ -25,6 +26,7 @@ from ..core import transform as core_transform
 from .design import (
     check_design_ready,
     extract_with_autoflip,
+    ordered_ids,
     rebuild_build_mesh,
     store_results,
 )
@@ -51,7 +53,10 @@ def build_solver(context, props):
     solver = core_order.OrderSolver(
         result.sticks,
         ground_epsilon_m=props.ground_epsilon_mm / 1000.0,
+        ground_height_m=props.build_plate_height_mm / 1000.0,
+        ground_required=props.require_build_plate,
         backtrack_limit=props.backtrack_limit,
+        robot_id=props.robot_id,
         jaw_width_m=props.jaw_width_mm / 1000.0,
         section_m=props.section_mm / 1000.0,
         check_jaw_clearance=props.check_jaw_clearance,
@@ -183,9 +188,77 @@ class SO100_OT_clear_build_order(Operator):
         return {"FINISHED"}
 
 
+class SO100_OT_move_build_step(Operator):
+    """Swap the active stick's build position with its immediate neighbour
+    (2026-08-23 user request: "I want to be able to move the steps before
+    or after its position" -- e.g. ``[s1,s3,s4,s2]`` moving ``s3`` earlier
+    gives ``[s3,s1,s4,s2]``, later gives ``[s1,s4,s3,s2]``). Only ever an
+    ADJACENT swap, matching the request's own examples -- not an arbitrary
+    move to any position.
+
+    Re-runs the pipeline through ``OrderSolver.replay()`` (never
+    ``solve()``) right after the swap, so the Scene's warnings/errors and
+    the build mesh reflect the NEW order immediately -- if the move breaks
+    C1 support or introduces a jaw-clearance clash, that shows up right
+    away rather than only at export time. See ``core/order.py``'s
+    ``replay()`` docstring for exactly what is and is not re-validated.
+    """
+
+    bl_idname = "so100.move_build_step"
+    bl_label = "Move Build Step"
+    bl_description = ("Swap this stick with its neighbour earlier/later in the "
+                      "build order, then re-validate the new order")
+    bl_options = {"REGISTER", "UNDO"}
+
+    direction: IntProperty(default=-1)
+
+    @classmethod
+    def poll(cls, context):
+        props = context.scene.so100
+        index = props.active_stick_index
+        return (
+            props.has_order
+            and 0 <= index < len(props.sticks)
+            and props.sticks[index].order >= 0
+        )
+
+    def execute(self, context):
+        props = context.scene.so100
+        current = props.sticks[props.active_stick_index]
+        target_order = current.order + self.direction
+        if not (0 <= target_order < len(props.sticks)):
+            self.report({"INFO"}, "%s is already at that end of the build order"
+                        % current.stick_id)
+            return {"CANCELLED"}
+        neighbour = next(
+            (item for item in props.sticks if item.order == target_order), None)
+        if neighbour is None:
+            return _report_error(
+                self, "No stick currently holds build position %d" % target_order)
+
+        current.order, neighbour.order = neighbour.order, current.order
+
+        try:
+            solver, (result, verdicts, auto_flipped) = build_solver(context, props)
+        except (ValueError, core_transform.SingularMatrix) as exc:
+            return _report_error(self, str(exc))
+        order_result = solver.replay(ordered_ids(props))
+        store_results(props, result, verdicts, auto_flipped, order_result)
+        rebuild_build_mesh(context, props, result)
+
+        self.report(
+            {"INFO"} if not order_result.errors else {"WARNING"},
+            "Moved %s %s -- %s"
+            % (current.stick_id, "earlier" if self.direction < 0 else "later",
+               props.order_summary),
+        )
+        return {"FINISHED"}
+
+
 _CLASSES = (
     SO100_OT_compute_build_order,
     SO100_OT_clear_build_order,
+    SO100_OT_move_build_step,
 )
 
 

@@ -34,13 +34,51 @@ re-validates and executes it; ROS2 writes status back to a sidecar.
 
 1. **Self-contained.** Everything needed to build the job is in the file — no
    references back into the `.blend`.
-2. **Already in robot coordinates.** Metres, in `base_link`. Blender does the
-   transform before writing; ROS2 does no frame conversion.
+2. **Already in robot coordinates.** Metres, in the TARGET robot's own root
+   frame — `base_link` for `so_arm_100`, `base` for `kr10_r900_2` (§A.1.1's
+   `robot` table; `frame` is a per-robot property, not a fixed name — a file
+   whose `frame` doesn't match the robot it claims via `robot` was never
+   correctly exported for that robot and must be refused, same severity as
+   a `robot`/`kinematics_version` mismatch). Blender does the transform
+   before writing; ROS2 does no frame conversion.
 3. **Ordered.** The `sticks` array *is* the build order. ROS2 executes it
    as-is and does not reorder — one authority, no drift.
 4. **Human-readable and diffable.** Pretty-printed, stable key order.
 5. **Status lives elsewhere.** The build file is immutable input; progress is
    written to a separate status file so a re-export never destroys progress.
+6. **One file, one robot.** ✅ **Added 2026-08-21** — the addon supports
+   multiple robot targets (§A.1.1); a build file is only ever valid for the
+   one it was exported for. `StickSpec` (§6) itself stays robot-agnostic
+   (base/tip/roll/length in whichever frame the file's own top-level
+   `frame`/`robot` say — no robot-specific concept baked into `StickSpec`
+   itself); it is only the `robot`/`kinematics_version`/`frame` triple at
+   the file's top level that pins a file to one executor.
+
+### A.1.1 Multi-robot support — robot ids
+
+The addon is not tied to one arm. Each supported robot has a **stable,
+lowercase snake_case id** matching the ROS package family name of its own
+kinematics module:
+
+| `robot` id | Kinematics package | Executor repo |
+|---|---|---|
+| `so_arm_100` | `so_arm_100_kinematics` | `SO-100-arm` (this repo) — 5-DOF, closed-form IK, testing/dev rig |
+| `kr10_r900_2` | `kr10_r900_2_kinematics` | `kuka_control` — 6-DOF, production rig |
+
+Adding a new robot means: a new id in this table, a new pure-Python
+kinematics package on the executor side following the same interface and
+vendoring rules as `so_arm_100_kinematics` (see that package's own
+`README.md`), and a vendored copy of it under the addon's
+`so100_builder/kinematics/<robot_id>/`. Nothing else in this protocol
+changes — `StickSpec`, the build-order solver, and the execution model
+(§A.4) are all already robot-agnostic.
+
+**Each robot's own geometric constants (`GRASP_OFFSET_M`, `JAW_RADIUS_M`,
+stock section, build volume, etc.) are that robot's kinematics package's own
+business, never hardcoded in the addon or in this protocol doc.** They reach
+a build file only indirectly, via the `stock`/`build_volume` fields (already
+per-file) and via whatever `grasp_offset_for_length()`-equivalent the robot's
+own kinematics module exposes.
 
 ## A.2 Build file format
 
@@ -52,6 +90,7 @@ re-validates and executes it; ROS2 writes status back to a sidecar.
   "source": "tower_v3.blend",
   "frame": "base_link",
   "units": "meters",
+  "robot": "so_arm_100",
   "kinematics_version": "1.0.0",
   "stock": { "section_m": [0.00645, 0.00645], "joint_allowance_m": 0.00325,
              "length_range_m": [0.080, 0.150] },
@@ -100,6 +139,10 @@ and match the addon's output.)*
 
 `s_002` has `shared_ends: 2`, so a further stick meets its tip — that
 neighbour would start at z = 0.2330, its own ideal vertex being z = 0.22975.
+`shared_ends` describes the stick's **final topology**, independent of
+`warnings: ["cantilever"]`, which describes its **temporary support state
+during the build sequence** — at the moment `s_002` is placed, only `s_001`
+supports it; whatever eventually attaches to its tip hasn't been built yet.
 
 `length_m` is the real stick length — what the operator cuts and loads — so
 `‖tip − base‖ == length_m` always, and the 80–150 mm range is checked against
@@ -112,7 +155,8 @@ validation check apply to these expanded coordinates.
 
 | Field | Meaning |
 |---|---|
-| `kinematics_version` | `so_arm_100_kinematics.__version__` of the copy that generated this file. **ROS2 must compare it against its own and refuse to execute on mismatch** — the two sides sharing a kinematics module is the entire basis for trusting Blender's validation, so a drifted copy is a hard error, not a warning. |
+| `robot` | ✅ **Added 2026-08-21.** The robot id (§A.1.1) this file was validated and exported for. **The executor must refuse to run a file whose `robot` doesn't match itself**, before even looking at `kinematics_version` — same severity as a version mismatch, for the same reason (a file for one arm's geometry is meaningless, not just stale, on another). |
+| `kinematics_version` | `__version__` of **that robot's own** kinematics package (`so_arm_100_kinematics`, `kr10_r900_2_kinematics`, …) — the copy that generated this file. **ROS2 must compare it against its own and refuse to execute on mismatch** — the two sides sharing a kinematics module is the entire basis for trusting Blender's validation, so a drifted copy is a hard error, not a warning. |
 | `order` | Build index. Must be dense and match array position. |
 | `length_m` | The **physical stick length** = ‖tip − base‖ = what the human cuts and loads into the feeder |
 | `shared_ends` | 0, 1 or 2 — how many of this stick's ends meet another stick. Informational; the gaps are already baked into `base`/`tip`. |
@@ -205,9 +249,13 @@ problem. So the addon must speak a transport.
 
 1. **Never block Blender's UI.** Long operations return immediately with an
    acknowledgement; completion arrives later as an event.
-2. **One frame, one unit system.** Everything on the wire is metres, in
-   `base_link`, right-handed Z-up. Blender does its own transform before
-   sending (see the addon doc §5). The bridge does *no* frame conversion.
+2. **One frame, one unit system.** Everything on the wire is metres, in the
+   connected robot's own root frame (§A.1.1 — `base_link` for `so_arm_100`,
+   `base` for `kr10_r900_2`; a live connection is inherently to one
+   specific robot's own server, so this is implicit in which one, not a
+   separate handshake field), right-handed Z-up. Blender does its own
+   transform before sending (see the addon doc §5). The bridge does *no*
+   frame conversion.
 3. **The robot is authoritative.** Blender proposes; ROS validates and may
    refuse. Blender must never assume a placement is reachable.
 4. **Additive evolution.** Unknown JSON fields are ignored by both sides;
@@ -409,7 +457,7 @@ Blender and ROS have to be re-synchronised after a restart on either side.
 
 ## 6. `StickSpec` object
 
-Identical on the wire and in `so_arm_100_stick_msgs/msg/StickSpec.msg`.
+Identical on the wire and in `stick_task_msgs/msg/StickSpec.msg`.
 
 ```json
 {
@@ -425,8 +473,8 @@ Identical on the wire and in `so_arm_100_stick_msgs/msg/StickSpec.msg`.
 | Field | Required | Meaning |
 |---|---|---|
 | `id` | yes | Stable identifier, generated by Blender, stable across saves |
-| `base` | yes | metres, `base_link`. **The end that seats against the table or another stick.** |
-| `tip` | yes | metres, `base_link`. The free end. |
+| `base` | yes | metres, the connected/target robot's own root frame (§A.1.1). **The end that seats against the table or another stick.** |
+| `tip` | yes | metres, same frame as `base`. The free end. |
 | `roll_deg` | no (default 0) | Rotation about the stick's own axis. Matters — the stock is square. |
 | `length_m` | no | Defaults to ‖tip − base‖. If given and inconsistent by >1 mm, the server responds `bad_request`. |
 | `section_m` | no | Defaults to the configured stock section. |

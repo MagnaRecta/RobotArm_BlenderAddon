@@ -9,7 +9,7 @@ import bpy
 from bpy.props import BoolProperty, StringProperty
 from bpy.types import AddonPreferences
 
-from . import kinematics
+from .core import robots as core_robots
 
 
 class SO100BuilderPreferences(AddonPreferences):
@@ -39,18 +39,21 @@ class SO100BuilderPreferences(AddonPreferences):
 
         box = layout.box()
         box.label(text="Vendored kinematics", icon="CON_KINEMATIC")
-        row = box.row()
-        row.label(text="Version: %s" % kinematics.__version__)
+        for profile in core_robots.ROBOTS.values():
+            row = box.row()
+            row.label(text="%s: %s" % (profile.id, profile.kinematics.__version__))
         box.label(
-            text="Written into every build file. ROS2 refuses to execute on a mismatch.",
+            text="Written into every build file as robot/kinematics_version. "
+                "ROS2 refuses to execute on a mismatch.",
             icon="INFO",
         )
 
+        so_arm_100 = core_robots.get_robot(core_robots.SO_ARM_100_ID).kinematics
         caveats = layout.box()
-        caveats.label(text="Unverified assumptions", icon="ERROR")
+        caveats.label(text="Unverified assumptions (so_arm_100)", icon="ERROR")
         column = caveats.column(align=True)
         column.label(text="GRASP_OFFSET_M = %.3f m is derived from FK, not measured."
-                          % kinematics.GRASP_OFFSET_M)
+                          % so_arm_100.GRASP_OFFSET_M)
         column.label(text="The stick_roll -> Wrist_Roll sign is untested on hardware.")
         column.label(text="Validation here is an upper bound; MoveIt has the final say.")
 

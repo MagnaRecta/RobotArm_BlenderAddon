@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from so100_builder.core import sticks as S  # noqa: E402
 from so100_builder.core.transform import v_dist  # noqa: E402
-from so100_builder.kinematics import constants as kc  # noqa: E402
+from so100_builder.kinematics.so_arm_100 import constants as kc  # noqa: E402
 
 MM = 0.001
 
@@ -305,6 +305,17 @@ class TestBasePlateFloor(unittest.TestCase):
         for position in result.expansion.positions:
             self.assertGreaterEqual(position[2], -1e-9)
 
+    def test_below_plate_is_relative_to_a_raised_ground_height(self):
+        # A design that sits happily on a raised plate (base at its own
+        # Z=0.100) still reports below_plate once the plate is raised
+        # PAST it -- the same physical check, just relative to the new
+        # height rather than a hardcoded Z=0.
+        points = [(0.0, -0.360, 0.100), (0.0, -0.360, 0.210)]
+        result = S.extract_sticks(points, [(0, 1)], ground_height_m=0.100)
+        self.assertNotIn("below_plate", [e[1] for e in result.errors])
+        result = S.extract_sticks(points, [(0, 1)], ground_height_m=0.150)
+        self.assertIn("below_plate", [e[1] for e in result.errors])
+
 
 class TestExpansionSolver(unittest.TestCase):
     def test_a_tree_with_one_foot_is_solved_exactly(self):
@@ -421,20 +432,24 @@ class TestLengthModes(unittest.TestCase):
 
 class TestLengthLimits(unittest.TestCase):
     def test_hard_floor_comes_from_the_kinematics_module(self):
-        # Sec 5.4: read the grip height from the shared module, never
-        # hardcode it -- Phase 0 confirms the real number with a ruler.
+        # Sec 5.4 / D13: read the grip-offset floor from the shared module,
+        # never hardcode it -- Phase 0 confirms the real numbers with a ruler.
         self.assertAlmostEqual(
-            S.hard_min_stick_length_m(), kc.GRASP_OFFSET_M + S.JAW_MARGIN_M, places=12
+            S.hard_min_stick_length_m(),
+            kc.MIN_GRASP_OFFSET_M + kc.JAW_CONTACT_HALF_LENGTH_M, places=12
         )
-        self.assertAlmostEqual(mm(S.hard_min_stick_length_m()), 66.0, places=6)
+        self.assertAlmostEqual(mm(S.hard_min_stick_length_m()), 35.0, places=6)
 
     def test_min_length_below_the_hard_floor_is_refused(self):
         with self.assertRaises(ValueError):
-            S.extract_sticks(STACK_POINTS, STACK_EDGES, min_stick_length_m=0.050)
+            S.extract_sticks(STACK_POINTS, STACK_EDGES, min_stick_length_m=0.030)
 
     def test_short_stick_is_reported_with_its_actual_length(self):
+        # Explicit min_stick_length_m: decouples this test's intent (the
+        # error message names the stick's actual length) from wherever the
+        # shared default (STICK_LENGTH_RANGE_M[0]) happens to sit.
         points = [(0.0, -0.360, 0.0), (0.0, -0.360, 0.070)]
-        result = S.extract_sticks(points, [(0, 1)])
+        result = S.extract_sticks(points, [(0, 1)], min_stick_length_m=0.100)
         codes = [(e[0], e[1]) for e in result.errors]
         self.assertIn((result.sticks[0].id, "too_short"), codes)
         self.assertIn("70.0 mm", result.errors[0][2])
@@ -450,6 +465,77 @@ class TestLengthLimits(unittest.TestCase):
         points = [(0.0, -0.360, 0.0), (0.0, -0.360, 0.148), (0.0, -0.360, 0.296)]
         result = S.extract_sticks(points, [(0, 1), (1, 2)], max_stick_length_m=0.150)
         self.assertEqual([e[1] for e in result.errors], [])
+
+
+# --- Multi-robot (docs/STATUS.md 2026-08-21/2026-08-23) -----------------------
+
+
+class TestMultiRobotGeometry(unittest.TestCase):
+    """core/sticks.py's mesh-expansion geometry (joint gaps, stock section,
+    length limits/floor) is now robot-aware -- previously every one of these
+    silently used so_arm_100's own numbers regardless of ``robot_id``."""
+
+    def test_hard_floor_differs_per_robot(self):
+        from so100_builder.kinematics.kr10_r900_2 import constants as krc
+
+        so_arm_100_floor = S.hard_min_stick_length_m("so_arm_100")
+        kr10_floor = S.hard_min_stick_length_m("kr10_r900_2")
+        self.assertAlmostEqual(mm(so_arm_100_floor), 35.0, places=6)
+        self.assertAlmostEqual(
+            kr10_floor, krc.MIN_GRASP_OFFSET_M + krc.JAW_CONTACT_HALF_LENGTH_M, places=12)
+        self.assertAlmostEqual(mm(kr10_floor), 18.0, places=6)
+        self.assertLess(kr10_floor, so_arm_100_floor)
+
+    def test_safe_bound_is_the_lowest_of_every_registered_robot(self):
+        # properties.py's own static widget min= bound -- must never exceed
+        # ANY registered robot's own real floor, or it would silently block
+        # a value that robot could otherwise legitimately use.
+        self.assertAlmostEqual(
+            S.safe_min_stick_length_bound_m(), S.hard_min_stick_length_m("kr10_r900_2"),
+            places=12)
+
+    def test_a_stick_between_the_two_robots_floors_is_refused_for_so_arm_100(self):
+        # 25mm clears kr10_r900_2's own floor (18mm) but not so_arm_100's
+        # (35mm) -- the check must use the robot it is actually asked about.
+        with self.assertRaises(ValueError):
+            S.extract_sticks(STACK_POINTS, STACK_EDGES, robot_id="so_arm_100",
+                             min_stick_length_m=0.025)
+
+    def test_the_same_stick_is_accepted_for_kr10(self):
+        result = S.extract_sticks(STACK_POINTS, STACK_EDGES, robot_id="kr10_r900_2",
+                                  min_stick_length_m=0.025)
+        self.assertEqual([e[1] for e in result.errors if e[1] == "too_short"], [])
+
+    def test_joint_allowance_defaults_to_the_selected_robots_own_value(self):
+        from so100_builder.kinematics.kr10_r900_2 import constants as krc
+
+        topology, _ = S.build_topology(U_POINTS, U_EDGES, U_IDS)
+        so_arm_100_required, _ = S.required_edge_lengths(topology, [0.110] * 3)
+        kr10_required, _ = S.required_edge_lengths(
+            topology, [0.110] * 3, joint_allowance_m=krc.JOINT_ALLOWANCE_M)
+        # kr10_r900_2's real joint allowance (1mm/end) is much smaller than
+        # so_arm_100's (3.25mm/end, square-stock formula) -- confirms this
+        # is a genuinely different number being used, not a coincidence.
+        self.assertLess(kr10_required[1] - 0.110, so_arm_100_required[1] - 0.110)
+
+    def test_extract_sticks_uses_kr10s_own_defaults_when_not_overridden(self):
+        from so100_builder.kinematics.kr10_r900_2 import constants as krc
+
+        result = S.extract_sticks(U_POINTS, U_EDGES, U_IDS, robot_id="kr10_r900_2")
+        top = next(s for s in result.sticks if s.id == "top")
+        # Required edge = stick + allowance * shared_ends (both ends shared
+        # for "top"): 110 + 2 * kr10's own 1mm allowance = 112mm, NOT
+        # so_arm_100's 116.5mm.
+        self.assertAlmostEqual(mm(top.required_edge_m),
+                               110.0 + 2000.0 * krc.JOINT_ALLOWANCE_M, places=3)
+        self.assertAlmostEqual(top.section_m[0], krc.STICK_SECTION_M, places=9)
+
+    def test_extract_sticks_still_defaults_to_so_arm_100_when_robot_id_omitted(self):
+        # Byte-for-byte unchanged default behaviour.
+        result = S.extract_sticks(U_POINTS, U_EDGES, U_IDS)
+        top = next(s for s in result.sticks if s.id == "top")
+        self.assertAlmostEqual(mm(top.required_edge_m), 116.5, places=3)
+        self.assertAlmostEqual(top.section_m[0], kc.STICK_SECTION_M, places=9)
 
 
 # --- Sec 5.2.3 / 6.2: warnings -----------------------------------------------
@@ -486,6 +572,48 @@ class TestWarnings(unittest.TestCase):
         points = [(0.0, -0.360, 0.100), (0.0, -0.360, 0.210)]
         result = S.extract_sticks(points, [(0, 1)])
         self.assertIn("floating_component", [e[1] for e in result.errors])
+
+    def test_raising_the_build_plate_to_its_lowest_point_grounds_it(self):
+        # Same stick as above -- its own lowest point is Z=0.100mm; a build
+        # plate physically raised to meet it is no longer "floating" (the
+        # plate is a real, height-adjustable object, 2026-08-23).
+        points = [(0.0, -0.360, 0.100), (0.0, -0.360, 0.210)]
+        result = S.extract_sticks(points, [(0, 1)], ground_height_m=0.100)
+        self.assertNotIn("floating_component", [e[1] for e in result.errors])
+
+    def test_the_floating_component_message_names_its_own_lowest_point(self):
+        points = [(0.0, -0.360, 0.100), (0.0, -0.360, 0.210)]
+        result = S.extract_sticks(points, [(0, 1)])
+        message = next(e[2] for e in result.errors if e[1] == "floating_component")
+        self.assertIn("100.0 mm", message)
+
+    def test_ground_required_false_never_reports_floating_component(self):
+        # A stick with no path to the plate at ANY height -- held by
+        # something this addon does not model (2026-08-23 user request:
+        # "I would put a stick's base... on shapes that are not a flat
+        # base"). No plate to check against means nothing is ever floating.
+        points = [(0.0, -0.360, 0.100), (0.0, -0.360, 0.210)]
+        result = S.extract_sticks(points, [(0, 1)], ground_required=False)
+        self.assertNotIn("floating_component", [e[1] for e in result.errors])
+
+    def test_ground_required_false_never_reports_below_plate(self):
+        # A stick that dips to negative Z -- would be below_plate under the
+        # default plate-at-Z=0 assumption, but there is no plate here.
+        points = [(0.0, -0.360, -0.040), (0.0, -0.360, 0.070)]
+        result = S.extract_sticks(points, [(0, 1)], ground_required=False)
+        self.assertNotIn("below_plate", [e[1] for e in result.errors])
+
+    def test_ground_required_false_solves_the_u_exactly_not_by_relaxation(self):
+        # The inverted-U's two feet both sit at Z=0, so under the default
+        # ground_required=True the plate behaves as a fourth edge and it
+        # takes the relaxation path (TestWorkedInvertedU, above). With no
+        # plate to test against, nothing is "grounded" (0 <= the exact
+        # solver's own <=1 requirement), so the SAME acyclic mesh takes the
+        # exact path instead, picking an arbitrary root.
+        result = S.extract_sticks(U_POINTS, U_EDGES, U_IDS, ground_required=False)
+        self.assertEqual(result.expansion.method, "exact")
+        self.assertEqual(result.errors, [])
+        self.assertLess(result.expansion.max_residual_m, 1e-9)
 
     def test_high_valence_vertex_is_flagged(self):
         centre = (0.0, -0.370, 0.100)

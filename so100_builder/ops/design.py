@@ -12,15 +12,45 @@ from bpy.props import BoolProperty, IntProperty, StringProperty
 from bpy.types import Operator
 from bpy_extras.io_utils import ExportHelper
 
+from ..core import robots as core_robots
 from ..core import sticks as core_sticks
 from ..core import state as core_state
 from ..core import transform as core_transform
 from ..core import validate as core_validate
 from ..properties import EDGE_ID_LAYER
 
-# Sec 9.1: the empty named this marks base_link.
-BASE_EMPTY_NAME = "SO100_Base"
-BUILD_MESH_NAME = "SO100_BuildMesh"
+# Sec 9.1: the empty marking each robot's own URDF root frame. Multi-robot
+# support (docs/STATUS.md 2026-08-21): so_arm_100 calls this frame
+# `base_link`, kr10_r900_2 calls it `base` (see each kinematics package's
+# own README) -- so the created object is named, and sized, per robot
+# rather than always "SO100_Base". One source of truth for both the
+# operator below and ui/panels.py's button text.
+BASE_EMPTY_NAME = "SO100_Base"  # kept as the so_arm_100 default/fallback
+BASE_EMPTY_NAMES = {
+    core_robots.SO_ARM_100_ID: "SO100_Base",
+    core_robots.KR10_R900_2_ID: "KR10_Base",
+}
+# Purely a viewport gizmo size (metres), not a physical robot constant --
+# KR10's own build volume is roughly 2x so_arm_100's linear scale (300mm
+# cube vs. so_arm_100's 240x160x200mm), so its gizmo is sized up to match
+# for on-screen legibility, nothing more.
+BASE_EMPTY_DISPLAY_SIZE_M = {
+    core_robots.SO_ARM_100_ID: 0.1,
+    core_robots.KR10_R900_2_ID: 0.15,
+}
+BUILD_MESH_NAME = "SO100_BuildMesh"  # kept as the so_arm_100 default/fallback
+BUILD_MESH_NAMES = {
+    core_robots.SO_ARM_100_ID: "SO100_BuildMesh",
+    core_robots.KR10_R900_2_ID: "KR10_BuildMesh",
+}
+
+
+def base_empty_name(robot_id):
+    return BASE_EMPTY_NAMES.get(robot_id, BASE_EMPTY_NAME)
+
+
+def build_mesh_name(robot_id):
+    return BUILD_MESH_NAMES.get(robot_id, BUILD_MESH_NAME)
 
 
 def _report_error(operator, message):
@@ -131,7 +161,22 @@ def check_design_ready(props):
     return None
 
 
-def extract_and_validate(points_m, edge_pairs, edge_ids, extract_kwargs, flips):
+def ordered_ids(props):
+    """Stick ids in build order. Empty when no order has been computed.
+
+    Lives here, not in ``ops/build.py`` where it originated, so
+    ``ops/order.py``'s manual-reorder operator can read it too without
+    ``ops/order.py`` importing ``ops/build.py`` (which already imports
+    ``build_solver`` FROM ``ops/order.py`` -- the other direction would be
+    circular). Both modules already import from here.
+    """
+    ordered = [item for item in props.sticks if item.order >= 0]
+    ordered.sort(key=lambda item: item.order)
+    return [item.stick_id for item in ordered]
+
+
+def extract_and_validate(points_m, edge_pairs, edge_ids, extract_kwargs, flips,
+                         robot_id):
     """``extract_sticks()`` + ``validate_sticks()``, which always run
     together. One call site so auto-flip's second pass cannot drift out of
     sync with the first."""
@@ -143,7 +188,7 @@ def extract_and_validate(points_m, edge_pairs, edge_ids, extract_kwargs, flips):
     # reachability, and its endpoints may not be what would get built.
     geometrically_bad = {stick_id for stick_id, _code, _msg in result.errors if stick_id}
     verdicts = core_validate.validate_sticks(
-        [s for s in result.sticks if s.id not in geometrically_bad]
+        [s for s in result.sticks if s.id not in geometrically_bad], robot_id
     )
     return result, verdicts
 
@@ -159,6 +204,7 @@ def extract_with_autoflip(context, props):
     points_m, edge_pairs, edge_ids, reassigned = read_design_mesh(context, props)
 
     extract_kwargs = dict(
+        robot_id=props.robot_id,
         joint_allowance_m=props.joint_allowance_mm / 1000.0,
         growth_mode=props.growth_mode,
         ground_mode=props.ground_mode,
@@ -168,12 +214,14 @@ def extract_with_autoflip(context, props):
         section_m=props.section_mm / 1000.0,
         merge_tolerance_m=props.merge_tolerance_mm / 1000.0,
         ground_epsilon_m=props.ground_epsilon_mm / 1000.0,
+        ground_height_m=props.build_plate_height_mm / 1000.0,
+        ground_required=props.require_build_plate,
         residual_tolerance_m=props.residual_tolerance_mm / 1000.0,
     )
     flips = {item.stick_id: item.flip for item in props.sticks if item.flip}
 
     result, verdicts = extract_and_validate(
-        points_m, edge_pairs, edge_ids, extract_kwargs, flips)
+        points_m, edge_pairs, edge_ids, extract_kwargs, flips, props.robot_id)
 
     # Finding 6: a stick can be unreachable ONLY because of which end got
     # picked as "base" -- Wrist_Roll's limit is asymmetric, so the opposite
@@ -188,7 +236,7 @@ def extract_with_autoflip(context, props):
         for stick_id in auto_flipped:
             flips[stick_id] = not flips.get(stick_id, False)
         result, verdicts = extract_and_validate(
-            points_m, edge_pairs, edge_ids, extract_kwargs, flips)
+            points_m, edge_pairs, edge_ids, extract_kwargs, flips, props.robot_id)
 
     return result, verdicts, auto_flipped, reassigned
 
@@ -345,8 +393,9 @@ def rebuild_build_mesh(context, props, result):
 
     obj = props.build_mesh
     if obj is None or obj.name not in bpy.data.objects:
-        mesh = bpy.data.meshes.new(BUILD_MESH_NAME)
-        obj = bpy.data.objects.new(BUILD_MESH_NAME, mesh)
+        name = build_mesh_name(props.robot_id)
+        mesh = bpy.data.meshes.new(name)
+        obj = bpy.data.objects.new(name, mesh)
         context.collection.objects.link(obj)
         props.build_mesh = obj
 
@@ -370,19 +419,72 @@ def rebuild_build_mesh(context, props, result):
 
 class SO100_OT_create_base_empty(Operator):
     bl_idname = "so100.create_base_empty"
-    bl_label = "Create SO-100 Base"
-    bl_description = ("Add an Empty marking base_link and point the addon at it. "
-                      "Move it to reposition the whole design relative to the robot")
+    bl_label = "Create Robot Base"
+    bl_description = ("Add an Empty marking the selected robot's own URDF root "
+                      "frame and point the addon at it. Move it to reposition "
+                      "the whole design relative to the robot")
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
         props = context.scene.so100
-        empty = bpy.data.objects.new(BASE_EMPTY_NAME, None)
+        robot_id = props.robot_id
+        empty = bpy.data.objects.new(base_empty_name(robot_id), None)
         empty.empty_display_type = "ARROWS"
-        empty.empty_display_size = 0.1
+        empty.empty_display_size = BASE_EMPTY_DISPLAY_SIZE_M.get(robot_id, 0.1)
         context.collection.objects.link(empty)
         props.base_empty = empty
         self.report({"INFO"}, "Created %s at the world origin" % empty.name)
+        return {"FINISHED"}
+
+
+# Per-robot overrides for the "Reset Stock" button, in mm. These are UI
+# ergonomics defaults -- a comfortable starting margin the user picked --
+# not the vendored kinematics module's own validation constants (e.g.
+# kr10_r900_2's JOINT_ALLOWANCE_M is 1mm, a measured hardware value used
+# in stick-length math; the button offers 1.5mm here as extra working
+# margin). Omitted fields fall back to the robot's own kinematics value.
+_STOCK_DEFAULT_OVERRIDES_MM = {
+    core_robots.KR10_R900_2_ID: {"section_mm": 2.0, "joint_allowance_mm": 1.5},
+}
+
+
+class SO100_OT_reset_stock_to_robot_defaults(Operator):
+    """Sets the Stock/Stick Length fields to the SELECTED robot's own
+    defaults (see ``_STOCK_DEFAULT_OVERRIDES_MM`` above). Not automatic on
+    every ``robot_id`` change (deliberately -- ``properties.py`` never
+    mutates itself via ``update=`` callbacks, matching the rest of this
+    module's own convention; see its docstring) -- these fields stay
+    so_arm_100's own defaults otherwise, which is physically wrong for a
+    robot with a different stock (e.g. kr10_r900_2's round 2mm stock vs.
+    so_arm_100's square 6.45mm), so this is the explicit, discoverable way
+    to pick up the right ones after switching robots.
+    """
+
+    bl_idname = "so100.reset_stock_to_robot_defaults"
+    bl_label = "Reset Stock to This Robot's Defaults"
+    bl_description = ("Set Stock Section, Joint Allowance and Min/Max Stick "
+                      "Length to the selected robot's own defaults -- "
+                      "these fields do not switch automatically, so pressing "
+                      "this after changing Robot is worth doing before designing")
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        props = context.scene.so100
+        kinematics = core_robots.get_robot(props.robot_id).kinematics
+        overrides = _STOCK_DEFAULT_OVERRIDES_MM.get(props.robot_id, {})
+        props.section_mm = overrides.get(
+            "section_mm", kinematics.STICK_SECTION_M * 1000.0)
+        props.joint_allowance_mm = overrides.get(
+            "joint_allowance_mm", kinematics.JOINT_ALLOWANCE_M * 1000.0)
+        props.min_stick_length_mm = kinematics.STICK_LENGTH_RANGE_M[0] * 1000.0
+        props.max_stick_length_mm = kinematics.STICK_LENGTH_RANGE_M[1] * 1000.0
+        self.report(
+            {"INFO"},
+            "Stock set to %r's own defaults -- section %.2f mm, joint "
+            "allowance %.2f mm, length %.0f-%.0f mm"
+            % (props.robot_id, props.section_mm, props.joint_allowance_mm,
+               props.min_stick_length_mm, props.max_stick_length_mm),
+        )
         return {"FINISHED"}
 
 
@@ -529,7 +631,17 @@ class SO100_OT_select_stick_in_viewport(Operator):
 class SO100_OT_step_stick(Operator):
     """Move the active stick by +/-1 and re-run the selection/frame above, so
     stepping through build order is a single repeated click (or a single
-    hotkey) rather than list-scroll-then-button each time."""
+    hotkey) rather than list-scroll-then-button each time.
+
+    ``props.active_stick_index`` is always an EXTRACTION-order index (it has
+    to be -- ``select_stick_in_viewport`` uses it directly as a build-mesh
+    edge index, and ``props.sticks`` never reorders; ``store_results``'s own
+    docstring). Once a build order exists, though, "step" has to mean "next
+    stick the robot actually places", not "next edge id" -- those differ
+    whenever auto-flip or the solver changed which stick got id N vs. build
+    position N. 2026-08-23, user-reported: stepping was following edge
+    order, making it useless for following the robot's actual build path.
+    """
 
     bl_idname = "so100.step_stick"
     bl_label = "Step Stick"
@@ -544,7 +656,18 @@ class SO100_OT_step_stick(Operator):
     def execute(self, context):
         props = context.scene.so100
         count = len(props.sticks)
-        props.active_stick_index = (props.active_stick_index + self.direction) % count
+
+        if props.has_order:
+            permutation = core_state.build_order_permutation(
+                [item.order for item in props.sticks])
+            inverse = [0] * count
+            for original_index, position in enumerate(permutation):
+                inverse[position] = original_index
+            position = permutation[props.active_stick_index]
+            props.active_stick_index = inverse[(position + self.direction) % count]
+        else:
+            props.active_stick_index = (props.active_stick_index + self.direction) % count
+
         if bpy.ops.so100.select_stick_in_viewport.poll():
             bpy.ops.so100.select_stick_in_viewport()
         return {"FINISHED"}
@@ -570,6 +693,7 @@ class SO100_OT_clear_results(Operator):
 
 _CLASSES = (
     SO100_OT_create_base_empty,
+    SO100_OT_reset_stock_to_robot_defaults,
     SO100_OT_extract_sticks,
     SO100_OT_select_stick_in_viewport,
     SO100_OT_step_stick,

@@ -53,20 +53,47 @@ is a search with an IK call inside its inner loop.
 import copy
 import math
 
-from ..kinematics.constants import CHAIN, GRASP_OFFSET_M, STICK_SECTION_M
+from . import robots as core_robots
 from . import validate as core_validate
 from .transform import v_add, v_dot, v_length, v_scale, v_sub
 
-_SHOULDER_AXIS_POINT = CHAIN[0][1]
+# Multi-robot support (docs/STATUS.md 2026-08-21/2026-08-23): the shoulder-
+# axis reference point and the jaw-model defaults below now come from
+# whichever robot's ``OrderSolver`` is constructed for (its own
+# ``CHAIN[0][1]``/``GRASP_OFFSET_M``/``JAW_RADIUS_M``), not so_arm_100's
+# unconditionally -- previously EVERY reachability check inside this
+# solver silently ran so_arm_100's kinematics regardless of the selected
+# robot, so a design correctly validated as buildable for kr10_r900_2
+# (``core/validate.py``, robot-aware since 2026-08-22) would still see
+# every candidate rejected here, backtrack immediately, and report a
+# single opaque "no candidate could be placed" or "floating component"
+# error with no obvious cause -- exactly what motivated this fix.
+#
+# ``jaw_segment``/``jaw_clearance``/``_horizontal_reach`` below are still
+# general-purpose geometry helpers usable standalone (as the tests do) --
+# their own keyword defaults stay so_arm_100's own constants, unchanged, for
+# exactly that reason. ``OrderSolver`` resolves and passes its own robot's
+# values explicitly at every call site instead of relying on those defaults.
+_SO_ARM_100 = core_robots.get_robot(core_robots.SO_ARM_100_ID).kinematics
+# ``.constants`` is reachable even though so_arm_100's own top-level package
+# does not re-export CHAIN (kr10_r900_2's does -- packages differ) -- see
+# core/mirror.py's own ``_tool_offset`` for why ``pkg.constants`` always
+# works regardless: importing a submodule via ``from .constants import X``
+# inside ``__init__.py`` always binds it as a real attribute of the package.
+_SO_ARM_100_SHOULDER_AXIS_POINT = _SO_ARM_100.constants.CHAIN[0][1]
 
 # --- jaw envelope ------------------------------------------------------------
-# ⚠ EVERY NUMBER HERE IS AN ESTIMATE, NOT A MEASUREMENT. ROS2 plan Phase 0:
-# "Measure the jaw envelope (width, depth, how far they protrude past the
-# TCP)". Sec 8.2 gives "~20 mm across" and says the clear region runs "out
-# to ~60 mm" from the target vertex, which is where JAW_LENGTH_M's 30 mm
-# (centred on the 51 mm grip point, so spanning 36..66 mm) comes from.
-# Treat a jaw-clearance verdict as indicative until Phase 0 lands.
-JAW_WIDTH_M = 0.020
+# ⚠ JAW_LENGTH_M is still a so_arm_100-SHAPED estimate, not (yet) sourced
+# per robot. ROS2 plan Phase 0: "Measure the jaw envelope (width, depth, how
+# far they protrude past the TCP)". Sec 8.2 gives "~20 mm across" and says
+# the clear region runs "out to ~60 mm" from the target vertex, which is
+# where 30 mm (centred on so_arm_100's 51 mm grip point, so spanning
+# 36..66 mm) comes from. kr10_r900_2's own grip offset (18.8 mm) and real
+# jaw envelope are a different scale entirely (its own gripper mesh bbox is
+# 23.65 x 15.39 x 36.8 mm -- see that package's README) -- do not assume
+# this constant scales sensibly for it without real measurements; it is
+# used here as-is (a soft, over-cautious pre-filter, never a hard block)
+# rather than inventing a KUKA-specific formula with no evidence behind it.
 JAW_LENGTH_M = 0.030
 
 # ROS2 plan Sec 7.2: `place.approach_clearance`, default 0.05 m. The jaws
@@ -95,6 +122,7 @@ DEFAULT_STEP_BUDGET = 400
 WARN_CANTILEVER = "cantilever"
 WARN_LOOP_CLOSURE = "loop_closure"
 WARN_JAW_CLEARANCE = "jaw_clearance"
+WARN_NO_BUILD_PLATE = "no_build_plate"
 
 ERROR_FLOATING_COMPONENT = "floating_component"
 ERROR_FORCED_PLACEMENT = "forced_placement"
@@ -151,7 +179,7 @@ def segment_distance(p1, q1, p2, q2):
     return v_length(v_sub(c1, c2))
 
 
-def jaw_segment(stick, grasp_offset_m=GRASP_OFFSET_M, jaw_length_m=JAW_LENGTH_M):
+def jaw_segment(stick, grasp_offset_m=_SO_ARM_100.GRASP_OFFSET_M, jaw_length_m=JAW_LENGTH_M):
     """The jaw body's own axis segment, centred on the grip point.
 
     ⚠ Read ``grasp_offset_m`` from the kinematics module, never hardcode it
@@ -164,10 +192,10 @@ def jaw_segment(stick, grasp_offset_m=GRASP_OFFSET_M, jaw_length_m=JAW_LENGTH_M)
 
 
 def jaw_clearance(stick, placed_sticks,
-                  grasp_offset_m=GRASP_OFFSET_M,
-                  jaw_width_m=JAW_WIDTH_M,
+                  grasp_offset_m=_SO_ARM_100.GRASP_OFFSET_M,
+                  jaw_width_m=_SO_ARM_100.JAW_RADIUS_M * 2.0,
                   jaw_length_m=JAW_LENGTH_M,
-                  section_m=STICK_SECTION_M,
+                  section_m=_SO_ARM_100.STICK_SECTION_M,
                   approach_clearance_m=APPROACH_CLEARANCE_M,
                   approach_samples=APPROACH_SAMPLES):
     """Sec 6 C3 / Sec 8.2: is the grip region clear of what is already built?
@@ -218,11 +246,13 @@ def jaw_clearance(stick, placed_sticks,
     return worst >= required, worst, offender
 
 
-def _horizontal_reach(point):
-    """Horizontal distance from Shoulder_Rotation's own axis -- Sec 6.1's
-    ``distance_from_robot``."""
-    return math.hypot(point[0] - _SHOULDER_AXIS_POINT[0],
-                      point[1] - _SHOULDER_AXIS_POINT[1])
+def _horizontal_reach(point, shoulder_axis_point=_SO_ARM_100_SHOULDER_AXIS_POINT):
+    """Horizontal distance from the robot's own first-joint axis -- Sec
+    6.1's ``distance_from_robot``. ``OrderSolver`` passes its own robot's
+    point explicitly (see module docstring); the default here is
+    so_arm_100's, for standalone/backward-compatible callers."""
+    return math.hypot(point[0] - shoulder_axis_point[0],
+                      point[1] - shoulder_axis_point[1])
 
 
 def flip_stick(stick):
@@ -242,13 +272,20 @@ def flip_stick(stick):
 # --- support graph -----------------------------------------------------------
 
 
-def grounded_vertices(sticks, ground_epsilon_m=0.0005):
-    """Vertex indices seating on the base plate."""
+def grounded_vertices(sticks, ground_epsilon_m=0.0005, ground_height_m=0.0):
+    """Vertex indices seating on the base plate.
+
+    ``ground_height_m`` (2026-08-23): the plate's own Z. 0.0 by default, but
+    the plate is a real, height-adjustable object -- raising this lets a
+    design that sits entirely above Z=0 be treated as resting on it, same
+    frame convention as ``core.sticks``'s own ``Topology.ground_height_m``.
+    """
+    threshold = ground_height_m + ground_epsilon_m
     grounded = set()
     for stick in sticks:
-        if stick.base[2] <= ground_epsilon_m:
+        if stick.base[2] <= threshold:
             grounded.add(stick.v_base)
-        if stick.tip[2] <= ground_epsilon_m:
+        if stick.tip[2] <= threshold:
             grounded.add(stick.v_tip)
     return grounded
 
@@ -280,10 +317,27 @@ def components(sticks):
     return out
 
 
-def floating_components(sticks, ground_epsilon_m=0.0005):
+def arbitrary_anchor_vertices(sticks):
+    """One vertex per connected component (2026-08-23) -- used by
+    ``OrderSolver`` when ``ground_required=False``: there is no plate to
+    test against, so each disconnected component still needs ONE anchor to
+    seed the build order from. Picks each component's lowest-id stick's own
+    base end, deterministically -- not a physically meaningful choice (there
+    is no plate height to prefer), just a stable one. Never claims the
+    result is physically self-supporting; the caller is trusted to know how
+    the assembly is actually held (a jig, a non-flat fixture, ...)."""
+    anchors = set()
+    for group in components(sticks):
+        first = min(group, key=lambda s: s.id)
+        anchors.add(first.v_base)
+    return anchors
+
+
+def floating_components(sticks, ground_epsilon_m=0.0005, ground_height_m=0.0):
     """Sec 6.2: sub-graphs with no grounded vertex. Unbuildable -- nothing
-    supports them."""
-    grounded = grounded_vertices(sticks, ground_epsilon_m)
+    supports them -- AT the plate's CURRENT height (``ground_height_m``);
+    see ``grounded_vertices``."""
+    grounded = grounded_vertices(sticks, ground_epsilon_m, ground_height_m)
     return [
         group for group in components(sticks)
         if not any(s.v_base in grounded or s.v_tip in grounded for s in group)
@@ -366,20 +420,48 @@ class OrderSolver:
 
     def __init__(self, sticks,
                  ground_epsilon_m=0.0005,
+                 ground_height_m=0.0,
+                 ground_required=True,
                  backtrack_limit=DEFAULT_BACKTRACK_LIMIT,
-                 grasp_offset_m=GRASP_OFFSET_M,
-                 jaw_width_m=JAW_WIDTH_M,
+                 robot_id=core_robots.SO_ARM_100_ID,
+                 grasp_offset_m=None,
+                 jaw_width_m=None,
                  jaw_length_m=JAW_LENGTH_M,
-                 section_m=STICK_SECTION_M,
+                 section_m=None,
                  approach_clearance_m=APPROACH_CLEARANCE_M,
                  check_jaw_clearance=True):
         self._sticks = {s.id: s for s in sticks}
         self._ground_epsilon_m = ground_epsilon_m
+        # The build plate's own Z (2026-08-23) -- 0.0 unless raised; see
+        # core.sticks's own ground_height_m docstring for the rationale.
+        self._ground_height_m = ground_height_m
+        # 2026-08-23, user request: a design held by something this addon
+        # does not model (a stick's own base as a jig, a non-flat fixture)
+        # rather than by a flat plate at any height -- see core.sticks's own
+        # ground_required docstring for the full rationale. False turns off
+        # both the floating_component exclusion and grounded_vertices() as
+        # the seed for _available, replacing them with
+        # arbitrary_anchor_vertices() so the search still has somewhere to
+        # start each disconnected component.
+        self._ground_required = ground_required
         self._backtrack_limit = backtrack_limit
-        self._grasp_offset_m = grasp_offset_m
-        self._jaw_width_m = jaw_width_m
+        # Multi-robot support: everything reachability-related below goes
+        # through the SELECTED robot's own kinematics, not so_arm_100's
+        # unconditionally (module docstring). `None` for grasp_offset_m/
+        # jaw_width_m/section_m means "use this robot's own default" --
+        # explicit values (as ops/order.py's build_solver() already passes
+        # for section_m/jaw_width_m, from the Design panel's UI fields)
+        # still override, unchanged.
+        self._robot_id = robot_id
+        self._kinematics = core_robots.get_robot(robot_id).kinematics
+        self._shoulder_axis_point = self._kinematics.constants.CHAIN[0][1]
+        self._grasp_offset_m = (
+            self._kinematics.GRASP_OFFSET_M if grasp_offset_m is None else grasp_offset_m)
+        self._jaw_width_m = (
+            self._kinematics.JAW_RADIUS_M * 2.0 if jaw_width_m is None else jaw_width_m)
         self._jaw_length_m = jaw_length_m
-        self._section_m = section_m
+        self._section_m = (
+            self._kinematics.STICK_SECTION_M if section_m is None else section_m)
         self._approach_clearance_m = approach_clearance_m
         self._check_jaw_clearance = check_jaw_clearance
 
@@ -390,18 +472,42 @@ class OrderSolver:
 
         # Sec 6.2: floating components can never be placed -- detect them up
         # front so the report names them, rather than letting the search
-        # thrash and then fail with something vague.
+        # thrash and then fail with something vague. Skipped entirely when
+        # ground_required=False: there is no plate to be floating relative
+        # to, so nothing is ever excluded on that basis.
         self._excluded_ids = set()
-        for group in floating_components(sticks, ground_epsilon_m):
-            ids = sorted(s.id for s in group)
-            for stick_id in ids:
-                self._excluded_ids.add(stick_id)
-            self._global_errors.append((
-                None, ERROR_FLOATING_COMPONENT,
-                "%d stick%s (%s%s) form a component with no vertex on the base "
-                "plate -- nothing supports it, so it cannot be built"
-                % (len(ids), "" if len(ids) == 1 else "s",
-                   ", ".join(ids[:4]), " ..." if len(ids) > 4 else ""),
+        if ground_required:
+            for group in floating_components(sticks, ground_epsilon_m, ground_height_m):
+                ids = sorted(s.id for s in group)
+                for stick_id in ids:
+                    self._excluded_ids.add(stick_id)
+                lowest_z = min(min(s.base[2], s.tip[2]) for s in group)
+                self._global_errors.append((
+                    None, ERROR_FLOATING_COMPONENT,
+                    "%d stick%s (%s%s) form a component with no vertex within "
+                    "%.2f mm of the build plate (currently at Z=%.1f mm) in the "
+                    "selected robot's own base frame -- nothing supports it at "
+                    "this plate height. Its own lowest point is %.1f mm; raising "
+                    "the build plate (ground_height_m) to about there would "
+                    "ground it, or uncheck Require Build Plate if it is held by "
+                    "something else entirely. If every stick looked buildable at "
+                    "extraction, also check that the design mesh actually sits "
+                    "on the robot base empty's own ground plane (its position/"
+                    "rotation), not just near the world origin"
+                    % (len(ids), "" if len(ids) == 1 else "s",
+                       ", ".join(ids[:4]), " ..." if len(ids) > 4 else "",
+                       ground_epsilon_m * 1000.0, ground_height_m * 1000.0,
+                       lowest_z * 1000.0),
+                ))
+        else:
+            self._global_warnings.append((
+                None, WARN_NO_BUILD_PLATE,
+                "Require Build Plate is off -- no vertex is checked against "
+                "the plate, and each disconnected part of the design starts "
+                "from an arbitrary anchor point rather than a grounded one. "
+                "This does not verify the result is physically self-"
+                "supporting; a stick reported as seating on the plate may "
+                "instead need external support you are providing yourself",
             ))
         self.result.unordered = sorted(self._excluded_ids)
 
@@ -409,7 +515,10 @@ class OrderSolver:
             s.id for s in sticks if s.id not in self._excluded_ids
         }
         self._total = len(self._remaining)
-        self._available = grounded_vertices(sticks, ground_epsilon_m)
+        self._available = (
+            grounded_vertices(sticks, ground_epsilon_m, ground_height_m)
+            if ground_required else arbitrary_anchor_vertices(sticks)
+        )
         self._placed = []                 # oriented specs, in order
         self._path = []                   # list[_Decision]
         self._excluded_at = [set()]       # per depth
@@ -450,7 +559,7 @@ class OrderSolver:
         key = (oriented.id, oriented.flipped)
         verdict = self._reach_cache.get(key)
         if verdict is None:
-            verdict = core_validate.validate_stick(oriented)
+            verdict = core_validate.validate_stick(oriented, self._robot_id)
             self._reach_cache[key] = verdict
         return verdict
 
@@ -494,7 +603,7 @@ class OrderSolver:
         midpoint = v_scale(v_add(stick.base, stick.tip), 0.5)
         supports = int(stick.v_base in self._available) + int(
             stick.v_tip in self._available)
-        return (max_z, -_horizontal_reach(midpoint), -supports)
+        return (max_z, -_horizontal_reach(midpoint, self._shoulder_axis_point), -supports)
 
     def _placement_warnings(self, oriented):
         warnings = []
@@ -562,8 +671,11 @@ class OrderSolver:
         self._queue = None
 
     def _rebuild_available(self):
-        self._available = grounded_vertices(
-            list(self._sticks.values()), self._ground_epsilon_m)
+        sticks = list(self._sticks.values())
+        self._available = (
+            grounded_vertices(sticks, self._ground_epsilon_m, self._ground_height_m)
+            if self._ground_required else arbitrary_anchor_vertices(sticks)
+        )
         for oriented in self._placed:
             self._available.add(oriented.v_base)
             self._available.add(oriented.v_tip)
@@ -726,6 +838,106 @@ class OrderSolver:
         the interactive path drives ``step()`` from a timer instead."""
         while not self.step(budget):
             pass
+        return self.result
+
+    def replay(self, sequence_ids):
+        """Places sticks in EXACTLY ``sequence_ids``'s order, never
+        searching for a better one -- ``solve()``'s counterpart for
+        applying a user's own manual reorder (2026-08-23, "move a step
+        before/after its position") without a fresh automatic search
+        silently overriding it.
+
+        Each stick's ORIENTATION (which end is ``base``) is taken exactly
+        as it already is on the ``StickSpec`` passed to this solver -- from
+        the ORIGINAL solve's own flip decision, carried forward through
+        ``props.sticks[i].flip`` / ``extract_sticks(flips=...)`` -- and
+        never re-decided here. Re-flipping would silently change which end
+        glues to what out from under a user who is deliberately curating a
+        sequence; if the existing orientation no longer has a supported
+        base at its new position, that is reported as an error instead
+        (below), not silently fixed by flipping it.
+
+        What IS re-checked, because it genuinely depends on order:
+
+        * **C1 support** -- does ``v_base`` attach to something already
+          placed (or the plate/an anchor) at THIS position in the sequence?
+        * **C3 jaw clearance** -- depends on what is already built, so a
+          move can introduce (or remove) a clash even though the stick's
+          own geometry has not changed.
+
+        Reachability itself (Phase B) depends only on the stick's own fixed
+        base/tip, never on order, so it is not order-sensitive and is
+        simply read via ``_reachability()``'s own cache.
+
+        A stick whose new position breaks C1 or jaw clearance is still
+        placed there, flagged with a clear reason (BRIDGE_PROTOCOL.md A.2:
+        every stick appears in the file, in order), exactly like ``solve()``
+        's own force-place path -- never silently dropped or silently
+        reordered again out from under the user.
+
+        Any stick id present in ``self._remaining`` but missing from
+        ``sequence_ids`` (typically a stick added since the sequence was
+        last stored, so it has no manually-chosen position yet) is placed
+        afterward, in a stable id-sorted order, rather than left out of the
+        result entirely.
+        """
+        if self._finished:
+            return self.result
+
+        seen = set()
+        ids_to_place = []
+        for stick_id in sequence_ids:
+            if stick_id not in seen:
+                seen.add(stick_id)
+                ids_to_place.append(stick_id)
+        ids_to_place.extend(
+            sorted(stick_id for stick_id in self._remaining if stick_id not in seen))
+
+        for stick_id in ids_to_place:
+            if stick_id not in self._remaining:
+                continue
+            oriented = self._sticks[stick_id]
+            verdict = self._reachability(oriented)
+            base_supported = oriented.v_base in self._available
+
+            reason = None
+            messages = []
+            warnings = []
+            if not base_supported:
+                reason = ("base does not attach to anything already built or "
+                          "to the plate at this position in the order")
+                messages = [(ERROR_FORCED_PLACEMENT, reason)]
+            elif not verdict.buildable:
+                reason = verdict.reason
+                messages = [(ERROR_FORCED_PLACEMENT, reason)]
+            else:
+                warnings = list(verdict.warnings)
+                if self._check_jaw_clearance:
+                    ok, gap, offender = jaw_clearance(
+                        oriented, self._placed,
+                        grasp_offset_m=self._grasp_offset_m,
+                        jaw_width_m=self._jaw_width_m,
+                        jaw_length_m=self._jaw_length_m,
+                        section_m=self._section_m,
+                        approach_clearance_m=self._approach_clearance_m,
+                    )
+                    if not ok:
+                        message = (
+                            "jaws come within %.1f mm of %s (need %.1f mm) at "
+                            "this position in the order; check it by eye"
+                            % (gap * 1000.0, offender,
+                               (self._jaw_width_m * 0.5 + self._section_m * 0.5)
+                               * 1000.0)
+                        )
+                        warnings.append(WARN_JAW_CLEARANCE)
+                        messages = [(WARN_JAW_CLEARANCE, message)]
+
+            warnings.extend(self._placement_warnings(oriented))
+            self._commit(oriented, warnings, reason, messages)
+
+        self._finished = True
+        self.result.complete = not self._excluded_ids
+        self._finalize()
         return self.result
 
 

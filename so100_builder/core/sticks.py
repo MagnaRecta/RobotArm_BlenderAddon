@@ -29,7 +29,7 @@ lives in ``ops/``.
 
 import math
 
-from ..kinematics import constants as kc
+from . import robots as core_robots
 from .transform import (
     angle_between,
     v_add,
@@ -39,16 +39,19 @@ from .transform import (
     v_sub,
 )
 
-# --- tunables that are NOT in the kinematics module -------------------------
+# Multi-robot support (docs/STATUS.md 2026-08-21/2026-08-23): every default
+# below that reads from a kinematics module now reads from the SELECTED
+# robot's own (``robot_id``, resolved via ``core_robots.get_robot``), not
+# so_arm_100's unconditionally -- previously the hard length floor, the
+# joint-allowance/stock-section defaults, and the tight-clearance geometry
+# all silently used so_arm_100's numbers regardless of the Scene's selected
+# robot. ``_SO_ARM_100`` below is kept only as the DEFAULT for standalone
+# callers (as the tests use directly) of the smaller helper functions --
+# ``extract_sticks()`` itself always resolves against whichever robot it is
+# actually called for.
+_SO_ARM_100 = core_robots.get_robot(core_robots.SO_ARM_100_ID).kinematics
 
-# Distance from the grip point to the far edge of the jaws. The hard physical
-# floor on stick length is GRASP_OFFSET_M + this: below it the jaws close at
-# or above the stick's tip (ROS2_IMPLEMENTATION_PLAN.md Sec 8.2). The plan
-# quotes ~66 mm for the floor, and GRASP_OFFSET_M is 51 mm, so 15 mm.
-# ⚠ GRASP_OFFSET_M itself is DERIVED FROM FK, NOT MEASURED WITH A RULER
-# (that package's README, "Known caveats", and ROS2 plan Phase 0). Everything
-# about stick placement depends on it.
-JAW_MARGIN_M = 0.015
+# --- tunables that are NOT in the kinematics module -------------------------
 
 # Sec 5.2.2 / N8, confirmed with the user 2026-07-28: an edge whose solved
 # length misses its target by more than this is reported as unbuildable.
@@ -76,14 +79,40 @@ GROUND_SLIDE = "SLIDE"
 GROUND_PIN = "PIN"
 
 
-def hard_min_stick_length_m():
-    """The floor below which ``min_stick_length`` must never be settable.
+def hard_min_stick_length_m(robot_id=core_robots.SO_ARM_100_ID):
+    """The floor below which ``min_stick_length`` must never be settable,
+    for the given robot.
 
-    Sec 5.4: *read the grip height from the shared kinematics module, never
-    hardcode it here* -- Phase 0 confirms the real number with a ruler, and a
-    hardcoded copy would not follow it.
+    Sec 5.4 / D13: this is no longer "grip height + jaw margin below which the
+    jaws close past the tip at a FIXED offset" -- the offset itself now
+    adapts per stick (``kinematics.grasp.grasp_offset_for_length()``), so the
+    floor is instead the length below which *that function itself* refuses
+    any offset at all: ``MIN_GRASP_OFFSET_M + JAW_CONTACT_HALF_LENGTH_M``.
+    Both constants live in the shared kinematics module, never hardcoded here
+    -- Phase 0 confirms the real numbers with a ruler. Read from the
+    SELECTED robot's own module, not so_arm_100's unconditionally -- each
+    robot's own floor genuinely differs (so_arm_100: 35mm; kr10_r900_2:
+    18mm, round 2mm stock -- see that package's own constants.py).
     """
-    return kc.GRASP_OFFSET_M + JAW_MARGIN_M
+    kinematics = core_robots.get_robot(robot_id).kinematics
+    return kinematics.MIN_GRASP_OFFSET_M + kinematics.JAW_CONTACT_HALF_LENGTH_M
+
+
+def safe_min_stick_length_bound_m():
+    """The lowest hard floor across every REGISTERED robot -- never any one
+    robot's own floor specifically.
+
+    Blender's own ``FloatProperty(min=...)`` is fixed at class-registration
+    time (``properties.py``), so it cannot depend on whichever robot happens
+    to be selected at the moment the user edits the field -- there is no
+    per-instance-dynamic bound in the Blender API for this. Using this
+    (permissive, safe-for-everyone) value as that STATIC widget bound, and
+    leaving the real, robot-SPECIFIC enforcement to ``extract_sticks()``'s
+    own runtime check (already robot-aware), is what keeps the widget from
+    blocking a value that is genuinely valid for the currently-selected
+    robot just because it is below some OTHER robot's own floor.
+    """
+    return min(hard_min_stick_length_m(robot_id) for robot_id in core_robots.ROBOTS)
 
 
 # --- data ---------------------------------------------------------------------
@@ -114,7 +143,7 @@ class StickSpec:
         self.roll_deg = roll_deg
         self.length_m = length_m
         self.shared_ends = shared_ends
-        self.section_m = section_m or (kc.STICK_SECTION_M, kc.STICK_SECTION_M)
+        self.section_m = section_m or (_SO_ARM_100.STICK_SECTION_M, _SO_ARM_100.STICK_SECTION_M)
         # Sec 5.2.3: the addon must show, per stick, design edge -> shared
         # ends -> required edge -> residual.
         self.design_edge_m = design_edge_m
@@ -144,10 +173,25 @@ class StickSpec:
 class Topology:
     """Merged vertices + edges, in ``base_link`` metres."""
 
-    def __init__(self, positions, edges, ground_epsilon_m=DEFAULT_GROUND_EPSILON_M):
+    def __init__(self, positions, edges, ground_epsilon_m=DEFAULT_GROUND_EPSILON_M,
+                ground_height_m=0.0, ground_required=True):
         self.positions = list(positions)
         self.edges = list(edges)  # (edge_id, i0, i1)
         self.ground_epsilon_m = ground_epsilon_m
+        # The physical build plate's own Z, in the SELECTED robot's base
+        # frame -- 0.0 by default (the plate at the robot's own origin
+        # height), but the plate is a real, height-adjustable object, so a
+        # component whose lowest point sits above Z=0 is not necessarily
+        # unsupported: raising the plate to meet it makes it grounded.
+        self.ground_height_m = ground_height_m
+        # 2026-08-23, user request: some designs are held by something this
+        # addon does not model at all (a stick's own base used as a jig, a
+        # non-flat fixture) -- ``ground_required=False`` turns is_grounded()
+        # permanently off, so nothing is ever treated as plate-seated. The
+        # caller is trusted to know how the assembly is actually supported;
+        # this only removes the addon's OWN plate check, never claims the
+        # result is physically self-supporting.
+        self.ground_required = ground_required
         self._adjacency = None
 
     @property
@@ -164,7 +208,9 @@ class Topology:
         return len(self.adjacency[i])
 
     def is_grounded(self, i):
-        return self.positions[i][2] <= self.ground_epsilon_m
+        if not self.ground_required:
+            return False
+        return self.positions[i][2] <= self.ground_height_m + self.ground_epsilon_m
 
     def components(self):
         """Connected components of the *mesh* graph (ground not counted as a
@@ -234,7 +280,8 @@ def merge_vertices(points, tolerance_m=DEFAULT_MERGE_TOLERANCE_M):
 
 def build_topology(points, edge_pairs, edge_ids=None,
                    merge_tolerance_m=DEFAULT_MERGE_TOLERANCE_M,
-                   ground_epsilon_m=DEFAULT_GROUND_EPSILON_M):
+                   ground_epsilon_m=DEFAULT_GROUND_EPSILON_M,
+                   ground_height_m=0.0, ground_required=True):
     """Merge coincident vertices and drop edges that collapse to a point."""
     merged, index_map = merge_vertices(points, merge_tolerance_m)
     if edge_ids is None:
@@ -249,7 +296,10 @@ def build_topology(points, edge_pairs, edge_ids=None,
             continue
         edges.append((eid, i0, i1))
 
-    return Topology(merged, edges, ground_epsilon_m), degenerate
+    return (
+        Topology(merged, edges, ground_epsilon_m, ground_height_m, ground_required),
+        degenerate,
+    )
 
 
 # --- Sec 5.3: length modes (run BEFORE the expansion solve) -------------------
@@ -303,7 +353,7 @@ def shared_end_flags(topology):
 
 
 def required_edge_lengths(topology, stick_lengths_m,
-                          joint_allowance_m=kc.JOINT_ALLOWANCE_M,
+                          joint_allowance_m=_SO_ARM_100.JOINT_ALLOWANCE_M,
                           growth_mode=GROWTH_PER_EDGE):
     """``required_edge = stick_length + allowance * shared_ends`` (Sec 5.2.1).
 
@@ -404,10 +454,11 @@ def solve_expansion(topology, required_lengths_m,
 
     ``ground_mode`` (Sec 5.2.2, decided 2026-07-28):
 
-    * ``GROUND_SLIDE`` (default) -- a grounded vertex is locked to z=0 but
-      free to move in XY. It cannot rise or sink, because the base plate is
-      physical and nothing expands below it, but it may slide across the
-      plate as the design grows.
+    * ``GROUND_SLIDE`` (default) -- a grounded vertex is locked to the build
+      plate's own Z (``topology.ground_height_m``, 0 unless the plate has
+      been raised) but free to move in XY. It cannot rise or sink, because
+      the base plate is physical and nothing expands through it, but it may
+      slide across the plate as the design grows.
     * ``GROUND_PIN`` -- grounded vertices are fully immobile. Retained as a
       toggle; it was the spec's original instruction.
 
@@ -496,7 +547,8 @@ def solve_expansion(topology, required_lengths_m,
             if ground_mode == GROUND_SLIDE:
                 for v in relaxation_vertices:
                     if topology.is_grounded(v):
-                        positions[v] = (positions[v][0], positions[v][1], 0.0)
+                        positions[v] = (
+                            positions[v][0], positions[v][1], topology.ground_height_m)
 
             if max_error < tolerance_m:
                 break
@@ -546,7 +598,7 @@ def _inset_endpoints(p0, p1, inset0, inset1, length_m, anchor0, anchor1):
 # --- Sec 5.2.3 / 6.2: per-vertex angle warnings ------------------------------
 
 
-def angle_allowance_m(theta_rad, section_m=kc.STICK_SECTION_M):
+def angle_allowance_m(theta_rad, section_m=_SO_ARM_100.STICK_SECTION_M):
     """``w / (2*tan(theta/2))`` -- how far two sticks of width ``w`` meeting
     at ``theta`` interpenetrate along each axis (Sec 5.2.3). 90 deg gives
     3.2 mm, matching the fixed value; 45 deg needs 7.8 mm; 30 deg needs
@@ -560,8 +612,8 @@ def angle_allowance_m(theta_rad, section_m=kc.STICK_SECTION_M):
     return abs(section_m / (2.0 * t))
 
 
-def vertex_clearance_warnings(topology, joint_allowance_m=kc.JOINT_ALLOWANCE_M,
-                              section_m=kc.STICK_SECTION_M):
+def vertex_clearance_warnings(topology, joint_allowance_m=_SO_ARM_100.JOINT_ALLOWANCE_M,
+                              section_m=_SO_ARM_100.STICK_SECTION_M):
     """Per vertex, the worst angle-based allowance and whether it exceeds the
     fixed one. Below ~45 deg the sticks physically clash, which no amount of
     glue fixes -- and under the Sec 5.2.1 model the gaps are what the
@@ -625,41 +677,84 @@ def _bounds(points):
 
 
 def extract_sticks(points_m, edge_pairs, edge_ids=None,
-                   joint_allowance_m=kc.JOINT_ALLOWANCE_M,
+                   robot_id=core_robots.SO_ARM_100_ID,
+                   joint_allowance_m=None,
                    growth_mode=GROWTH_PER_EDGE,
                    ground_mode=GROUND_SLIDE,
                    stock_lengths_m=None,
                    min_stick_length_m=None,
                    max_stick_length_m=None,
-                   section_m=kc.STICK_SECTION_M,
+                   section_m=None,
                    merge_tolerance_m=DEFAULT_MERGE_TOLERANCE_M,
                    ground_epsilon_m=DEFAULT_GROUND_EPSILON_M,
+                   ground_height_m=0.0,
+                   ground_required=True,
                    residual_tolerance_m=DEFAULT_RESIDUAL_TOLERANCE_M,
                    flips=None):
-    """Full Sec 5 pipeline. ``points_m`` and the result are in ``base_link``
-    metres -- do the Blender transform with ``core.transform`` first.
+    """Full Sec 5 pipeline. ``points_m`` and the result are in the SELECTED
+    robot's own frame (``base_link`` for so_arm_100, ``base`` for
+    kr10_r900_2) -- do the Blender transform with ``core.transform`` first.
 
     ``stock_lengths_m`` selects fixed-stock-length mode (Sec 5.3); ``None``
     means design-driven mode, where the stick length is the edge as drawn.
-    """
-    if min_stick_length_m is None:
-        min_stick_length_m = kc.STICK_LENGTH_RANGE_M[0]
-    if max_stick_length_m is None:
-        max_stick_length_m = kc.STICK_LENGTH_RANGE_M[1]
 
-    floor = hard_min_stick_length_m()
+    ``joint_allowance_m``/``section_m``/``min_stick_length_m``/
+    ``max_stick_length_m`` all default (``None``) to the SELECTED robot's
+    own kinematics constants, not so_arm_100's unconditionally -- e.g.
+    kr10_r900_2's real joint allowance is 1 mm/end (round-stock contact,
+    KUKA_IMPLEMENTATION_PLAN.md KQ3), a genuinely different physical model
+    from so_arm_100's 3.25 mm square-stock formula, never just a smaller
+    number of the same shape. Pass explicit values (as ``ops/design.py``
+    does, from the Design panel's own UI fields) to override.
+
+    ``ground_height_m`` (2026-08-23): the build plate's own Z, in the same
+    frame as ``points_m``. 0.0 (the default) means the plate sits at the
+    robot's own origin height, matching every design so far. The plate is a
+    real, height-adjustable object, though -- a component that does not
+    reach Z=0 is not necessarily unbuildable, just unbuildable *at the
+    plate's current height*. Raising this value lets a design that sits
+    entirely above Z=0 (previously reported as ``floating_component``)
+    solve and place normally, as if the plate had been physically raised to
+    meet it.
+
+    ``ground_required`` (2026-08-23): ``True`` (default) means every design
+    is checked against the plate as above. ``False`` turns that check off
+    entirely -- no vertex is ever treated as plate-seated, so nothing is
+    ever reported as ``floating_component`` or ``below_plate``, and the
+    expansion solve treats every component as free-floating (an arbitrary
+    vertex anchors each one instead of a grounded one). For a design held
+    by something this addon does not model at all -- a stick's own base
+    used as a jig, a non-flat fixture -- rather than by a flat plate at any
+    height. This does not verify the result is physically self-supporting;
+    the caller is trusted to know how it is actually held.
+    """
+    kinematics = core_robots.get_robot(robot_id).kinematics
+    if joint_allowance_m is None:
+        joint_allowance_m = kinematics.JOINT_ALLOWANCE_M
+    if section_m is None:
+        section_m = kinematics.STICK_SECTION_M
+    if min_stick_length_m is None:
+        min_stick_length_m = kinematics.STICK_LENGTH_RANGE_M[0]
+    if max_stick_length_m is None:
+        max_stick_length_m = kinematics.STICK_LENGTH_RANGE_M[1]
+
+    floor = hard_min_stick_length_m(robot_id)
     if min_stick_length_m < floor - 1e-9:
         raise ValueError(
-            "min_stick_length %.1f mm is below the hard physical floor of "
-            "%.1f mm (grip height %.1f mm + jaw margin %.1f mm). Below this "
-            "the jaws close at or above the stick's tip."
-            % (min_stick_length_m * 1000.0, floor * 1000.0,
-               kc.GRASP_OFFSET_M * 1000.0, JAW_MARGIN_M * 1000.0)
+            "min_stick_length %.1f mm is below %r's hard physical floor of "
+            "%.1f mm (MIN_GRASP_OFFSET_M %.1f mm + JAW_CONTACT_HALF_LENGTH_M "
+            "%.1f mm). Below this, grasp_offset_for_length() cannot find any "
+            "offset that both fits within the stick and clears the floor-"
+            "clearance floor."
+            % (min_stick_length_m * 1000.0, robot_id, floor * 1000.0,
+               kinematics.MIN_GRASP_OFFSET_M * 1000.0,
+               kinematics.JAW_CONTACT_HALF_LENGTH_M * 1000.0)
         )
 
     result = ExtractionResult()
     topology, degenerate = build_topology(
-        points_m, edge_pairs, edge_ids, merge_tolerance_m, ground_epsilon_m
+        points_m, edge_pairs, edge_ids, merge_tolerance_m, ground_epsilon_m,
+        ground_height_m, ground_required,
     )
     result.topology = topology
     for eid in degenerate:
@@ -702,17 +797,21 @@ def extract_sticks(points_m, edge_pairs, edge_ids=None,
         )
 
     clearance = vertex_clearance_warnings(topology, joint_allowance_m, section_m)
-    for group in topology.components():
+    for group in (topology.components() if ground_required else []):
         if not any(topology.is_grounded(v) for v in group):
             members = set(group)
             ids = sorted(
                 eid for eid, i0, _i1 in topology.edges if i0 in members
             )
+            lowest_z = min(topology.positions[v][2] for v in members)
             result.errors.append(
                 (None, "floating_component",
                  "%d sticks (%s%s) form a component with no vertex on the base "
-                 "plate -- nothing supports it"
-                 % (len(ids), ", ".join(ids[:4]), " ..." if len(ids) > 4 else ""))
+                 "plate (currently at Z=%.1f mm) -- nothing supports it. Its "
+                 "own lowest point is %.1f mm; raising the build plate to "
+                 "about there would ground it"
+                 % (len(ids), ", ".join(ids[:4]), " ..." if len(ids) > 4 else "",
+                    ground_height_m * 1000.0, lowest_z * 1000.0))
             )
 
     # --- Sec 5.2 inset + Sec 5.5 output ------------------------------------
@@ -791,17 +890,20 @@ def extract_sticks(points_m, edge_pairs, edge_ids=None,
                  % (length * 1000.0, max_stick_length_m * 1000.0))
             )
 
-        # The base plate is physical: nothing can sit below z=0. GROUND_SLIDE
-        # holds grounded vertices at exactly z=0, but a vertex drawn below the
-        # plate -- or pushed there by the expansion -- has to be reported, not
-        # silently clamped, since clamping would move the design without
-        # saying so.
+        # The base plate is physical: nothing can sit below its own Z
+        # (ground_height_m, 0 unless raised). GROUND_SLIDE holds grounded
+        # vertices at exactly that height, but a vertex drawn below the
+        # plate -- or pushed there by the expansion -- has to be reported,
+        # not silently clamped, since clamping would move the design
+        # without saying so. Only applies when there IS a plate to be below
+        # (ground_required) -- with no plate this check has nothing to mean.
         lowest = min(base[2], tip[2])
-        if lowest < -ground_epsilon_m:
+        if ground_required and lowest < ground_height_m - ground_epsilon_m:
             result.errors.append(
                 (eid, "below_plate",
-                 "stick reaches %.1f mm below the base plate -- nothing can be "
-                 "built under z=0" % (-lowest * 1000.0))
+                 "stick reaches %.1f mm below the base plate (Z=%.1f mm) -- "
+                 "nothing can be built under it"
+                 % ((ground_height_m - lowest) * 1000.0, ground_height_m * 1000.0))
             )
 
         if abs(residual) > residual_tolerance_m:

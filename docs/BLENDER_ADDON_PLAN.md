@@ -15,7 +15,7 @@ installed on this machine.** Target: **Blender 5.2.0 LTS**, Linux + Windows.
 ## 1. What the addon is for
 
 The user models a sculpture in Blender as a **wireframe mesh**: every edge is
-one wooden stick (6.45 mm square stock, **80–150 mm** long). The addon turns
+one wooden stick (6.45 mm square stock, **50–150 mm** long — §5.4). The addon turns
 that mesh into a buildable job:
 
 1. **Extract** sticks from the mesh edges.
@@ -141,23 +141,29 @@ so100_builder/
 ├── blender_manifest.toml   (or bl_info — see B8)
 ├── __init__.py             register()/unregister(), module wiring
 ├── prefs.py                AddonPreferences
-├── properties.py           PropertyGroups on Scene and Object
-├── kinematics/             *** VENDORED VERBATIM from so_arm_100_kinematics ***
-│   ├── __init__.py         exports + __version__
-│   ├── chain.py            FK + closed-form IK (ROS2 doc §9.3)
-│   ├── constants.py        URDF-derived geometry, limits, grasp offset
-│   ├── envelope.py         reachability queries
-│   └── VERSION             must match __version__; recorded in every build file
-│                           (see that package's own README.md for the rules)
+├── properties.py           PropertyGroups on Scene and Object, incl. `robot_id`
+├── kinematics/             *** one VENDORED VERBATIM package per robot (§4a) ***
+│   ├── so_arm_100/         from so_arm_100_kinematics -- hardware-validated
+│   │   ├── __init__.py     exports + __version__
+│   │   ├── chain.py        FK + closed-form IK (ROS2 doc §9.3)
+│   │   ├── constants.py    URDF-derived geometry, limits, grasp offset
+│   │   ├── envelope.py     reachability queries
+│   │   ├── grasp.py        grasp-orientation transform (ROS2 doc §9.6) --
+│   │   │                   core/validate.py calls this, never reimplements it
+│   │   ├── jaw_clearance.py swept-gripper collision pre-filter
+│   │   └── VERSION         must match __version__; recorded in every build file
+│   │                       (see that package's own README.md for the rules)
+│   └── kr10_r900_2/        placeholder -- kr10_r900_2_kinematics doesn't exist yet
 ├── core/
+│   ├── robots.py           *** robot registry + kinematics-package contract (§4a) ***
 │   ├── transform.py        Blender world <-> base_link metres (B5, B6)
 │   ├── sticks.py           mesh edges -> StickSpec; joint allowance; cut list
 │   ├── order.py            *** build-order solver (§6) ***
+│   ├── mirror.py           robot-mirror rig geometry (§10.4)
 │   ├── validate.py         order-aware validation (§7)
 │   └── state.py            build state; .blend + JSON persistence (QB4)
 ├── io/
-│   ├── export_build.py     write the build file (protocol Part A)
-│   └── import_status.py    read back per-stick status after a build
+│   └── build_file.py       the build file + status sidecar (protocol Part A)
 ├── net/                    (Option A / live telemetry only)
 │   ├── client.py           worker thread + queues + main-thread pump
 │   └── protocol.py
@@ -169,9 +175,386 @@ so100_builder/
 └── tests/                  run via `blender --background --python tests/run.py`
 ```
 
-**The `kinematics/` folder is a verbatim copy, never a fork.** Add a CI check
-(or a `make sync-kinematics`) comparing it against the ROS2 package, and a
-`VERSION` file so a mismatch is loud rather than silent.
+**Each `kinematics/<robot_id>/` folder is a verbatim copy, never a fork.**
+Add a CI check (or a `make sync-kinematics`) comparing it against its
+ROS2/ROS upstream package, and a `VERSION` file so a mismatch is loud rather
+than silent.
+
+### 4a. ✅ Multi-robot support — DONE 2026-08-21; kr10_r900_2 vendored for real 2026-08-22
+
+**Kicked off 2026-08-21** (docs/STATUS.md): the addon is not tied to one
+arm. BRIDGE_PROTOCOL.md §A.1.1 defines a `robot` id per supported robot
+(`so_arm_100`, `kr10_r900_2`) and requires each to have its own vendored
+kinematics package under `kinematics/<robot_id>/`. **Both are now real,
+vendored packages** — `kr10_r900_2_kinematics` (a genuine, tested 6-DOF
+closed-form solver, `kuka_control` repo) landed 2026-08-22, sooner than
+expected; this section documents the addon side of both.
+
+**`core/robots.py`** is the seam: a small `RobotProfile` per registered robot
+id (the vendored kinematics module, plus optional `build_volume_min_m` /
+`build_volume_max_m` / `stock_section_m` defaults), and `get_robot(robot_id)`
+to look one up. Its own module docstring is the canonical, load-bearing
+statement of **the kinematics-package interface contract** every robot's
+vendored package must satisfy — summarized:
+
+| Name | Contract |
+|---|---|
+| `__version__` | Written into every build file as `kinematics_version`. |
+| `STICK_LENGTH_RANGE_M` | This robot's own stock-length limits (§5.4). |
+| `grasp_offset_for_length(length_m)` | The per-stick-length grip offset (D13). |
+| `fk(joint_angles_rad)` | `(position, rotation_matrix)`. Loop over `zip(CHAIN, joint_angles_rad)` then unconditionally append ONE fixed final transform — `core/mirror.py`'s preview rig depends on exactly this shape (see below), for any joint count. |
+| `check_jaw_clearance(base, tip, placed_sticks, ...)` | The swept-gripper collision pre-filter (§6 C3). |
+| `Unreachable` | Exception class, caught by name, never by string-matching. |
+| `JOINT_NAMES` | This robot's joint order. |
+
+**"Solve a stick placement" is deliberately NOT in that table.** so_arm_100's
+`solve_stick_placement(base, tip)` and kr10_r900_2's own function of the same
+name are compatible by coincidence (both take just `base`/`tip` and return
+joints, raising `Unreachable`), but kr10_r900_2's round stock has a
+genuinely free roll DOF that single-roll call under-reports — its own
+`solve_stick_placement_any_roll(base, tip)` (sweeps roll × branch) is what a
+real placement needs. `core/validate.py` and `ops/mirror.py` therefore
+dispatch **explicitly per robot id** for this one operation
+(`_validate_stick_so_arm_100` / `_validate_stick_kr10_r900_2`, and a
+matching `_solve_placement()` helper in `ops/mirror.py`) rather than forcing
+a fake shared signature across two genuinely different arms.
+
+A new robot means: a new vendored sub-directory under `kinematics/`, a new
+`RobotProfile` entry in `core/robots.py`, a new row in BRIDGE_PROTOCOL.md
+§A.1.1's table, and — if its own "solve a placement" shape differs from both
+existing robots' — its own dispatch branch in `core/validate.py`/
+`ops/mirror.py`. Everything else (the registry, `ops/build.py`'s export, the
+mirror rig's FK-derivation math) needs no change.
+
+**`core/mirror.py`'s preview rig needs no per-robot EE_OFFSET constant.**
+so_arm_100 exports one (`constants.EE_OFFSET`); kr10_r900_2 does not (its
+tool transform is a private, composed `(translation, rotation)` pair inside
+`chain.py`, never meant to be read from outside). Rather than require every
+future robot to export a named constant, `joint_frames()` derives the fixed
+offset by calling the robot's own `fk(())` — zero joint angles, so the
+`zip(CHAIN, joint_angles_rad)` loop runs zero times and whatever `fk()`
+returns *is* the fixed final transform in isolation. Confirmed empirically
+to match so_arm_100's own `EE_OFFSET` exactly, and works identically for
+kr10_r900_2. Not a re-derivation of either robot's math — a call into their
+own already-tested `fk()`, the same "not a second FK implementation"
+principle `joint_frames()` already followed for so_arm_100 alone.
+
+**A new Scene-level `robot_id` EnumProperty** (`properties.py`, default
+`so_arm_100`) is threaded through:
+- `core/validate.py` — so_arm_100 keeps its exact existing behaviour
+  (`_validate_stick_so_arm_100`, byte-for-byte unchanged); kr10_r900_2 gets
+  its own `_validate_stick_kr10_r900_2` (uses `solve_stick_placement_any_roll`,
+  see above); any *other* robot id falls through to a minimal
+  `_validate_stick_generic` (contract-only `solve_stick_placement`, any
+  failure becomes a clean `Verdict(False, reason)`, never a crash) as a
+  safety net until it earns its own richer path.
+- `core/mirror.py`'s `joint_frames()` — takes the robot's kinematics module
+  explicitly; derives the tool offset via `fk(())` (see above) instead of a
+  named constant.
+- `ops/mirror.py`'s preview rig — resolves the module via
+  `core_robots.get_robot(props.robot_id)`, dispatches to the right "solve a
+  placement" call via its own `_solve_placement()`, and reports (rather than
+  raises) any failure as the rig's status line. Its point-count/segment
+  logic is robot-agnostic (`_segments(point_count)`, not a hardcoded 5).
+- `ops/build.py`'s `Export Build File` — stamps `robot`/`kinematics_version`
+  from the selected profile, and **refuses to export** (a clean operator
+  error, not a crash or an invented number) on either of two independent
+  missing facts: `RobotProfile.is_vendored` being false (no kinematics
+  package at all), or `has_build_volume` being false (no confirmed
+  `build_volume_min_m`/`max_m`) — knowing *where* a robot may build is a
+  separate fact from being able to compute *whether* a placement is
+  reachable there. Neither gate fires for either registered robot today.
+- `ops/design.py`'s `Create Robot Base` operator (added 2026-08-22 — the
+  addon previously had no way to create a base empty for anything but
+  so_arm_100) — names the created empty per robot (`SO100_Base` /
+  `KR10_Base`, `base_empty_name(robot_id)`, the one place that name is
+  decided) and sizes its viewport gizmo up for KR10's larger scale (a
+  cosmetic choice, not a physical constant). `ui/panels.py`'s Design panel
+  shows the button's label dynamically from the same function, so the two
+  can never drift apart, and `properties.py`'s `base_empty` pointer
+  property is itself already robot-agnostic (marks "the selected robot's
+  own URDF root frame", not literally `base_link`).
+
+**`kr10_r900_2`'s build volume is confirmed** (given directly by the user
+2026-08-22, corrected 2026-08-23 -- the direction was actually +X, not −Y,
+docs/STATUS.md): a 300×300×300 mm cube centred 450 mm from the robot
+origin along +X — `X ∈ [300, 600]`, `Y ∈ [−150, +150]`,
+`Z ∈ [0, 300]` mm in `base_link`, same convention as so_arm_100's own
+`BUILD_VOLUME_MIN_M`/`MAX_M` (one horizontal axis centred on 0, the other
+centred on the given distance, Z sitting on the base plate rather than
+centred vertically). Set
+directly on `core/robots.py`'s `RobotProfile` construction, not read from
+the kinematics package — `kr10_r900_2_kinematics` has no build-volume
+concept at all (BRIDGE_PROTOCOL.md §A.1.1 treats that as this addon's own
+concern). `RobotProfile.stock_section_m`, by contrast, *is* read from the
+vendored package now that it's real: `kr10_r900_2_kinematics.STICK_SECTION_M`
+= 2 mm (round stock), matching so_arm_100's own pattern.
+
+✅ **`ui/overlay.py`'s build-volume box and `ui/panels.py`'s Reference panel
+numbers are robot-aware** (added 2026-08-23, `docs/STATUS.md`): both now
+read `core_robots.get_robot(props.robot_id).build_volume_min_m`/`max_m`
+instead of always drawing/printing `so_arm_100`'s box — selecting
+`kr10_r900_2` shows its real 300×300×300 mm cube in the viewport. The
+Reference panel's so_arm_100-specific empirical caveats ("98% reachable
+for vertical sticks", the `GRASP_OFFSET_M` grip-height note) stay gated to
+`robot_id == "so_arm_100"` rather than being generalized — they are that
+robot's own measured/derived facts, not a general truth to project onto a
+robot they were never checked against.
+
+✅ **`core/order.py`'s build-order solver is robot-aware** (fixed 2026-08-23,
+`docs/STATUS.md`, reported by the user as "Compute Build Order" reporting
+`0 in order - 0 warnings - 1 error` for an otherwise-valid kr10_r900_2
+design). `OrderSolver` now takes a `robot_id` (default `so_arm_100`,
+preserving that robot's exact existing behaviour) and resolves its own
+`_reachability()` check, its C2 cost heuristic's shoulder-axis reference
+point (`CHAIN[0][1]`), and its C3 jaw-clearance model's `grasp_offset_m`/
+`jaw_width_m`/`section_m` defaults from the SELECTED robot's own kinematics
+(`GRASP_OFFSET_M`, `JAW_RADIUS_M`, `STICK_SECTION_M`) — previously every one
+of these silently used `so_arm_100`'s, regardless of `robot_id`, so a stick
+correctly validated as buildable against kr10_r900_2's own kinematics
+(`core/validate.py`, robot-aware since 2026-08-22) would still be evaluated
+against so_arm_100's much smaller reach *inside the order solver*, forcing
+either a bogus rejection or (if nothing in the design even reads as
+grounded relative to the selected base empty) a single opaque
+`floating_component` error — exactly what was reported, with no indication
+which robot's kinematics was actually being checked. `ops/order.py`'s
+`build_solver()` now passes `robot_id=props.robot_id`. `jaw_length_m`
+(0.030 m, an so_arm_100-shaped estimate — see the inline comment) is the
+one piece **not** yet sourced per robot: no equivalent real-world
+measurement exists for kr10_r900_2 yet, and it is a soft, over-cautious
+pre-filter (a C3 warning, never a hard block), so it is left as-is rather
+than inventing an unfounded KUKA-specific formula.
+`floating_component`'s own error message now also names the ground
+tolerance and suggests checking the design mesh's position against the
+selected robot's own base empty, since that remains a likely real cause of
+this error independent of the fix above.
+
+✅ **`core/sticks.py`'s mesh-expansion geometry is robot-aware** (fixed
+2026-08-23, `docs/STATUS.md`, user request after the C2 fix above didn't
+fully resolve a still-recurring build-order error). `extract_sticks()` now
+takes `robot_id` (default `so_arm_100`, byte-for-byte unchanged) and
+resolves its `joint_allowance_m`/`section_m`/`min_stick_length_m`/
+`max_stick_length_m` defaults, and `hard_min_stick_length_m(robot_id)`'s
+own floor, from the SELECTED robot's own kinematics
+(`JOINT_ALLOWANCE_M`/`STICK_SECTION_M`/`STICK_LENGTH_RANGE_M`/
+`MIN_GRASP_OFFSET_M`/`JAW_CONTACT_HALF_LENGTH_M`) instead of so_arm_100's
+unconditionally — kr10_r900_2's real joint allowance (1 mm/end, round-stock
+contact) is a genuinely different physical model from so_arm_100's 3.25 mm
+square-stock formula, not just a smaller number of the same shape.
+`ops/design.py`'s `extract_with_autoflip()` now passes `robot_id=
+props.robot_id` through (it already passed the OTHER four values explicitly
+from the Design panel's own UI fields, so those were never silently wrong,
+just defaulted to so_arm_100's numbers when a design started — see below).
+
+**The Design panel's Stock/Stick Length fields still show so_arm_100's own
+starting numbers regardless of `robot_id`**, since Blender's
+`FloatProperty` defaults are fixed at class-registration time and cannot
+depend on another property's runtime value — there is no per-instance-
+dynamic default in the Blender API for this, and `properties.py` does not
+use `update=` callbacks (existing codebase convention). Rather than leave
+that as a trap, a new **`Reset Stock to This Robot's Defaults`** button
+(`ops.design.SO100_OT_reset_stock_to_robot_defaults`, in the Design panel's
+Stock box) sets Stock Section, Joint Allowance, and Min/Max Stick Length to
+the currently-selected robot's own defaults in one explicit, discoverable
+action — worth pressing right after switching `robot_id` and before
+drawing a new design. For kr10_r900_2, Stock Section and Joint Allowance
+default to 2.0 mm / 1.5 mm — a UI-ergonomics starting margin the user
+picked (`_STOCK_DEFAULT_OVERRIDES_MM` in `ops/design.py`), not the vendored
+kinematics module's own `JOINT_ALLOWANCE_M` (1 mm, a measured hardware
+value used in the actual stick-length math) — every field the button sets
+stays fully editable afterward. `min_stick_length_mm`'s own static widget
+`min=`
+bound was also widened from so_arm_100's fixed 35 mm to
+`core_sticks.safe_min_stick_length_bound_m()` (the lowest floor across
+every registered robot, 18 mm today) so it can never block a value that is
+genuinely valid for whichever robot is actually selected — the real,
+robot-SPECIFIC floor is still enforced by `extract_sticks()`'s own runtime
+check.
+
+**`ops/design.py`'s build mesh is now named per robot too**
+(`SO100_BuildMesh` / `KR10_BuildMesh`, `build_mesh_name(robot_id)` — mirrors
+`base_empty_name()`'s own pattern exactly) — previously always
+`SO100_BuildMesh` regardless of `robot_id`, another user-reported naming
+mismatch. Like the base empty, only the object's name at CREATION time is
+robot-aware; an existing build mesh from before this fix, or from a design
+started under a different `robot_id`, keeps its original name until
+cleared and re-extracted.
+
+✅ **The build plate's own height is now adjustable** (added 2026-08-23, user
+request: "I would like to be able to print 'floating' sticks. The build
+plate can change in height, so I want to make this a possibility"). Every
+Sec 5.2.2/6.2 ground check ("is this vertex on the plate", used both to
+solve the mesh expansion and to decide which sticks can start a build
+order) previously compared a vertex's Z against a fixed 0 — `core/sticks.py`'s
+`Topology.ground_height_m` and `core/order.py`'s `grounded_vertices()`/
+`floating_components()`/`OrderSolver` all gained a `ground_height_m`
+parameter (default 0.0, so every existing design is unaffected byte-for-
+byte) that shifts that reference instead. The physical build plate is a
+real, height-adjustable object: a component that sits entirely above Z=0 —
+previously always rejected outright as `floating_component`, unbuildable no
+matter what — is not actually unbuildable, just unbuildable *at the plate's
+current height*. Raising `ground_height_m` to that component's own lowest
+point (now named directly in the `floating_component`/`below_plate` error
+messages, e.g. "raising the build plate to about there would ground it")
+makes it solve and order normally, exactly as if the plate had been
+physically raised to meet it. Exposed as a new **Build Plate Height**
+field (`properties.py`'s `build_plate_height_mm`, Design panel's Mesh
+Expansion box, next to Ground mode) threaded through
+`ops/design.py::extract_with_autoflip()` and `ops/order.py::build_solver()`
+from the same scene property, so extraction's `below_plate` check and the
+order solver's grounding check always agree on where the plate currently
+is. Not exported in the build file (BRIDGE_PROTOCOL.md unchanged): a
+raised plate only changes which components the addon treats as supported
+during design/ordering, never any stick's own absolute placement
+coordinates, so the ROS2 side needs nothing new to execute the file
+correctly.
+
+✅ **A `Require Build Plate` checkbox turns the ground check off entirely**
+(added 2026-08-23, same-day follow-up: "sometimes for testing, I would put
+a stick's base or other kind or shapes that are not a flat base, so I want
+some flexibility for those scenarios"). `ground_height_m` above still
+assumes a single FLAT plate at *some* height; some designs are held by
+something this addon does not model as a plate at all — a stick's own base
+used as a jig, a non-flat fixture. `core/sticks.py`'s
+`Topology.ground_required` (default `True`) and `core/order.py`'s
+`OrderSolver`/`grounded_vertices()`/`floating_components()` all gained a
+`ground_required` parameter with the same default: `False` makes
+`Topology.is_grounded()` permanently return `False`, so nothing is ever
+plate-seated —
+
+* the `floating_component` and `below_plate` checks are skipped entirely
+  (there is no plate to be floating relative to, or below);
+* the mesh-expansion solve naturally routes every acyclic component through
+  its existing "no grounded vertex" fallback (`_solve_component_exact`'s
+  `root = grounded[0] if grounded else min(group)`, already there for a
+  transient case, now a real path) and the `GROUND_SLIDE` clamp/`GROUND_PIN`
+  pin never fire, so the design solves fully free-floating;
+* the order solver seeds `OrderSolver._available` from a new
+  `core.order.arbitrary_anchor_vertices()` (one deterministic vertex per
+  connected component — the lowest-id stick's own base end) instead of
+  `grounded_vertices()`, so the search still has somewhere to start each
+  disconnected part, and a `WARN_NO_BUILD_PLATE` global warning is added so
+  the result is never silently presented as verified support-valid.
+
+**Topological validity is untouched** — every subsequent stick still has to
+attach to an already-placed one (or its own component's arbitrary anchor);
+only the PLATE requirement is relaxed, never the "attach to something"
+one. Exposed as `properties.py`'s `require_build_plate` (Design panel, Mesh
+Expansion box, above Ground/Build Plate Height, which it hides when
+unchecked since they have no effect without a plate) threaded through both
+`ops/design.py::extract_with_autoflip()` and `ops/order.py::build_solver()`
+from the same scene property. Like `ground_height_m`, not exported in the
+build file: it only changes which components the addon's OWN checks treat
+as supported, never any stick's coordinates.
+
+✅ **"Check By Eye" stepping now follows BUILD order, not extraction/edge
+order** (fixed 2026-08-23, user-reported: "the arrow goes to the next stick
+maybe by edge number? It does not follow the newly computed order"). Sec
+10.3's `props.sticks` deliberately always stays in EXTRACTION order —
+`select_stick_in_viewport` needs "build-mesh edge *i* is `sticks[i]`" to
+hold so it can index straight into the build mesh — but
+`SO100_OT_step_stick` was doing plain `active_stick_index +/- 1` on that
+same extraction-order index, which is only ever the build sequence by
+coincidence. The Sticks list's own `filter_items` already solved exactly
+this for DISPLAY via `build_order_permutation()` (`[build_order_per_item]
+-> [display_position_per_item]`, unordered sticks sorting last); `step_stick`
+now inverts that same permutation to find "the extraction index whose build
+position is current position ± 1", so a repeated click (or hotkey) walks
+the actual sequence the robot will place sticks in, falling back to plain
+index stepping only when no order has been computed yet (there is no build
+sequence to follow in that state). `build_order_permutation()` moved from
+`ui/panels.py` to `core/state.py` to make this possible at all — the
+function is pure Python (no `bpy`) and was only trapped in a `bpy`-importing
+module before; `ops/design.py` importing `ui/panels.py` directly would have
+been circular, since `ui/panels.py` already imports from `ops/design.py`.
+This also fixed a pre-existing testability gap: the function's own tests
+(`TestBuildOrderPermutation`) moved to a new `tests/test_state.py` and now
+run in bare CPython, not just under Blender. New
+`test_step_stick_follows_build_order_once_one_exists` in
+`test_blender_integration.py` exercises the real operator path end to end
+against the wireframe-cube fixture (whose build order provably differs from
+its extraction order — the top ring can only be placed after the bottom
+one) rather than only the pure permutation logic in isolation.
+
+✅ **`kr10_r900_2` gained a robot base box, and its build volume dropped
+20mm** (added 2026-08-23, user request: a 320×320×20mm box "below the robot
+(origin)", and lowering the build volume box "to account the height of the
+base box of the robot above"). `core/robots.py`'s `RobotProfile` gained
+`base_box_min_m`/`base_box_max_m` (`None` by default, same "not confirmed /
+not applicable" convention as `build_volume_min_m`/`max_m`) and a
+`has_base_box` property; `kr10_r900_2`'s profile sets them to a 320×320×20mm
+box centred on the robot's own X/Y origin, `Z ∈ [−20, 0]` mm — directly
+BELOW the robot's own coordinate origin, representing its physical mounting
+pedestal. Since the robot's own origin sits at the TOP of that pedestal,
+20mm above the actual table surface, `kr10_r900_2`'s `build_volume_min_m`/
+`max_m` Z shifted from `[0, 300]` to `[−20, 280]` mm to match — the build
+cube's own floor now sits at the SAME table-level Z as the pedestal's own
+floor, not at the robot's coordinate origin. `so_arm_100` has no base box
+(`has_base_box` False, nothing drawn) — the user asked for this "just when
+the kuka robot is selected". Purely a viewport/Reference-panel reference
+aid, like `build_volume_min_m`/`max_m` before it: `ui/overlay.py`'s
+box-corner math was factored into a shared `_box_edge_points()` helper so
+`_volume_box_points()` and the new `_base_box_points()` share it rather than
+duplicating the 12-edge wireframe logic, drawn in a distinct tan/brown
+colour (`_BASE_BOX_COLOR`) so it reads as "physical furniture" rather than
+"where you may build". `ui/panels.py`'s Reference panel shows its numbers
+too, gated the same way. Never exported to the build file (module docstring
+note on `base_box_min_m`/`max_m`): the ROS2 side already knows its own
+robot's footprint from its URDF, so this stays a Blender-side design aid
+only, unlike `build_volume_min_m`/`max_m` which IS exported. New tests in
+`test_robots.py`, `test_blender_integration.py` (both the overlay points and
+the shifted build-volume/export numbers); existing hardcoded `[0.3, -0.15,
+0.0]`-style expectations across those files updated to the new `-0.02`
+floor.
+
+✅ **Build order can be manually reordered after computing it** (added
+2026-08-23, user request: "After computing a build order, I want to be able
+to move the steps before of after its position" — `[s1,s3,s4,s2]` moving
+`s3` earlier gives `[s3,s1,s4,s2]`, later gives `[s1,s4,s3,s2]`). New
+`core/order.py::OrderSolver.replay(sequence_ids)`, `solve()`'s counterpart:
+places sticks in EXACTLY the given order rather than searching for one,
+using each stick's EXISTING orientation (never re-deciding which end is
+`base` — that stays exactly what the original solve, or `props.sticks[i].
+flip`, already chose) and re-checking only what genuinely depends on order:
+**C1 support** (does this stick's base attach to something already placed,
+or the plate/an anchor, at ITS NEW position?) and **C3 jaw clearance**
+(depends on what is already built). Reachability itself does not depend on
+order (Phase B validates a stick's own fixed geometry), so it is read from
+the solver's own cache, unchanged. A position that breaks C1 or jaw
+clearance is still placed there and flagged with a clear reason
+(BRIDGE_PROTOCOL.md A.2: every stick appears, in order) — never silently
+dropped or silently re-ordered back to "correct" by a hidden second solve.
+A stick id missing from the given sequence (new since it was last stored) is
+appended afterward in a stable id-sorted order rather than lost.
+
+New `ops.order.SO100_OT_move_build_step` operator (Sticks panel, "Move
+Earlier"/"Move Later" buttons next to Check By Eye) swaps the active
+stick's `order` with its immediate NEIGHBOUR only — matching the request's
+own adjacent-swap examples exactly, not an arbitrary jump to any position —
+then immediately re-runs the pipeline through `replay()` (never `solve()`)
+so warnings/errors and the build mesh reflect the new order right away, not
+only at export time. `ops.build.SO100_OT_export_build_file` now calls
+`solver.replay(ordered_ids(props))` instead of `solver.solve()` whenever
+`props.has_order` is already True, so an export **respects** a prior manual
+reorder instead of silently discarding it with a fresh automatic search —
+`solve()` still runs, as before, the first time no order exists yet.
+`ordered_ids()` (previously private to `ops/build.py`) moved to
+`ops/design.py` so `ops/order.py`'s new operator could read it too without
+`ops/order.py` importing `ops/build.py` (which already imports
+`build_solver` FROM `ops/order.py` — the other direction would be
+circular). New `TestReplay` in `test_order.py` (a deterministic straight
+3-stick chain, forced order, no ties for the search to break
+arbitrarily — reused from `TestSimpleStack`) covers the algorithm directly;
+new tests in `test_blender_integration.py` exercise the real operator path
+end to end, including confirming export actually reflects a manual reorder.
+
+⚠ **What is *not* yet robot-parameterized, deliberately (scope boundary, not
+an oversight):** `core/order.py`'s C3 jaw-clearance model's `jaw_length_m`
+constant (0.030 m, so_arm_100-shaped, no kr10_r900_2 equivalent measurement
+yet — see that module's own note) is the one piece of the build pipeline
+still not sourced per robot. It is a soft, over-cautious pre-filter (a
+warning, never a hard block), so this is a quality nuance, not a
+correctness gap like the ones fixed above.
 
 ---
 
@@ -186,7 +569,9 @@ Each **edge** of the designated mesh becomes one stick. For each edge:
 
 1. Take both vertices' world positions via `matrix_world`.
 2. Apply `scene.unit_settings.scale_length` → metres.
-3. Transform into the `SO100_Base` empty's frame → this *is* `base_link`.
+3. Transform into the robot base empty's frame (`SO100_Base` for so_arm_100,
+   `KR10_Base` for kr10_r900_2 — §4a/§9.1) → this *is* that robot's own
+   URDF root frame (`base_link` for so_arm_100, `base` for kr10_r900_2).
 4. Decide which end is `base` (the end that seats down): the lower Z, unless
    the stick connects to an already-placed stick at the other end — see §6.
    Overridable per stick.
@@ -249,30 +634,32 @@ vertices and push each vertex along its parent edge's direction by the
 required amount. Every edge lands on its target length exactly, and the
 design's angles are preserved. No solver needed.
 
-**Structures with closed loops — approximate.** In the inverted U, raising
-both top vertices by 3.25 mm fixes the uprights but leaves the top edge at
-110 mm; widening it to 116.5 mm then tilts the uprights by ~1.6°.
+**Structures with closed loops — usually still exact, sometimes not.** In the
+inverted U, raising both top vertices by 3.25 mm fixes the uprights but
+leaves the top edge at 110 mm; widening it to 116.5 mm then tilts the
+uprights by ~1.6°.
 
 *(Corrected 2026-07-28 against the implementation: that tilt does **not**
 leave a residual. Tilting shortens the uprights' vertical extent, and the
 solver simply raises the top vertices to compensate, landing all three edges
 on target — 113.25 / 116.50 / 113.25 mm — to better than 0.001 mm. The
-earlier claim that the uprights end at 113.30 mm and that "every edge cannot
-be satisfied simultaneously" came from stopping the reasoning one step early.
-A 4-vertex U has enough freedom to be exact. Genuinely over-constrained cases
-do exist — see the flat-square example below — but this is not one of them.)*
+earlier claim here — that the uprights end at 113.30 mm and that "every edge
+cannot be satisfied simultaneously" — came from stopping the reasoning one
+step early. A 4-vertex U has enough freedom to be exact. Genuinely
+over-constrained cases do exist — see the flat-square example below — but
+this is not one of them.)*
 
 Solve it as **iterative constraint relaxation** (position-based dynamics
-style): repeatedly, for each edge, move both endpoints symmetrically along the
-edge to correct its length error. A few dozen iterations converge to
-sub-0.1 mm residuals for structures of this scale.
+style): repeatedly, for each edge, move both endpoints along the edge to
+correct its length error. A few dozen iterations converge to sub-0.1 mm
+residuals for structures of this scale.
 
 ✅ **Grounded vertices: SLIDE, decided 2026-07-28.** A grounded vertex is
 **locked to z = 0 but free to move in XY**. It cannot rise or sink — the base
 plate is physical — but it may slide across the plate as the design grows.
 
-This replaces an earlier "pin grounded vertices" instruction, which was wrong:
-fully pinning them makes **any closed loop lying on the base plate
+This replaces an earlier "pin grounded vertices" instruction, which was
+wrong: fully pinning them makes **any closed loop lying on the base plate
 unexpandable**. Every vertex of a square drawn flat on the plate would be
 immobile, so none of its edges could grow at all and all four would report a
 −6.5 mm residual. That contradicts §5.2.1's whole premise that the design
@@ -300,12 +687,13 @@ most one grounded vertex is still solved exactly by the outward walk of the
 acyclic case; the ground mode only matters once a second anchor or a mesh
 cycle closes a loop. Pinning is what makes the base plate behave as an extra
 edge, so *two* pinned feet turn even an acyclic mesh into the looped case —
-which is exactly why the inverted U below is treated as looped despite having
+which is exactly why the inverted U above is treated as looped despite having
 4 vertices and 3 edges.
 
 **Report the residual per edge.** Any edge that cannot reach its target within
-tolerance is a design the sticks will not physically fit — the user must know
-which one, not discover it at the glue gun.
+tolerance (a genuinely over-constrained case, e.g. the flat square under PIN)
+is a design the sticks will not physically fit — the user must know which
+one, not discover it at the glue gun.
 
 **Optional simplification: uniform growth.** Add 3.25 mm at *every* end,
 jointed or not — so every edge grows by exactly 6.5 mm and free ends simply
@@ -367,18 +755,30 @@ re-break every edge length the solver just satisfied.
 
 ### 5.4 Length limits
 
-Enforce **80–150 mm** on the **stick length** — which, under §5.2.1, is the
+Enforce **50–150 mm** on the **stick length** — which, under §5.2.1, is the
 *design* edge length, not the expanded one. The expanded edge is longer by the
 joint gaps and is not what gets cut or gripped.
 
-Two distinct limits (ROS2 doc §8.2):
-- **`min_stick_length` = 80 mm** — the user's stock threshold. A UI field, so
-  it can be lowered if short sticks turn out to be wanted.
-- **Hard floor ≈ 66 mm** — grip height (51 mm) + jaw margin. Below this the
-  jaws close at or above the stick's tip. Never allow the field below it.
+D13 (ROS2_IMPLEMENTATION_PLAN.md §4) replaced the old *fixed* grip offset with
+one that adapts per stick (`kinematics.grasp.grasp_offset_for_length()`):
+always the largest offset that keeps the jaws' contact fully on the stick,
+never less. That is what let the minimum drop from 80 mm to 50 mm.
 
-⚠ **Read the grip height from the shared kinematics module's constants, never
-hardcode it here** — Phase 0 confirms the real number with a ruler.
+Two distinct limits (ROS2 doc §8.2):
+- **`min_stick_length` = 50 mm** (`STICK_LENGTH_RANGE_M[0]`) — the user's
+  stock threshold. A UI field, so it can be lowered further, but only after
+  re-examining `MIN_GRASP_OFFSET_M` (see below).
+- **Hard floor = 35 mm** — `MIN_GRASP_OFFSET_M` (30 mm) +
+  `JAW_CONTACT_HALF_LENGTH_M` (5 mm). Below this, `grasp_offset_for_length()`
+  itself raises `Unreachable`: no offset both fits within the stick and clears
+  the floor-clearance floor. Never allow the field below it.
+
+⚠ **Read both constants from the shared kinematics module, never hardcode
+them here.** `MIN_GRASP_OFFSET_M` is an unmeasured placeholder — same status
+as `GRASP_OFFSET_M` elsewhere in this doc — chosen low enough that it does not
+bind anywhere in `STICK_LENGTH_RANGE_M` today (the 50 mm case computes to
+45 mm), but not yet confirmed on hardware. Confirm with Phase 0 before
+trusting either number for a real short stick.
 
 ### 5.5 Cut list output
 
@@ -410,11 +810,6 @@ finished tall structure is blocked. Because the arm reaches outward
 horizontally (ROS2 doc §9.4), the secondary rule is **build far-from-robot
 first, near-to-robot last** within a layer.
 
-**C3 — Jaw clearance.** The jaws sit only ~51 mm above the stick's base — i.e.
-right at the glue joint. The cone around each target vertex must be clear.
-Placing the sticks that share a vertex in a bad order can make the last one
-impossible to insert.
-
 ⚠ **A design constraint found while implementing this (2026-07-29), worth
 knowing before drawing a sculpture: tangential horizontals are cheap, radial
 horizontals are expensive.** A horizontal stick pointing *at or away from*
@@ -425,6 +820,11 @@ height and stick length tried**, while its two tangential rungs were fine.
 A "ladder" (stacked inverted-Us, all horizontals tangential) builds cleanly
 in the same space. No ordering can fix this: it is a property of the
 placement, not the sequence.
+
+**C3 — Jaw clearance.** The jaws sit only ~51 mm above the stick's base — i.e.
+right at the glue joint. The cone around each target vertex must be clear.
+Placing the sticks that share a vertex in a bad order can make the last one
+impossible to insert.
 
 ### 6.1 Proposed algorithm — greedy topological build with backtracking
 
@@ -467,7 +867,7 @@ Notes:
 | **Loop closure** — the last stick of a triangle/quad | Must fit exactly between two already-glued vertices; absorbs all accumulated error | Flag as high-risk; suggest cutting ~1 mm short (ROS2 doc §10.2) |
 | **Floating component** — a sub-graph with no grounded vertex | Unbuildable | Hard error, name the component |
 | **High-valence vertex** — many sticks meeting at one point | Jaw clearance collapses | Warn with the computed clearance |
-| **Out-of-plane tilt** | ⚠ **Corrected 2026-07-28 (ROS2 doc §9.4) — this IS reachable**, contrary to what this row used to say. Still comparatively untested territory (a single-point IK check, no self-collision modelling), so worth a second look. | Warn (not a hard error), with the offending angle, so the user can "Check By Eye" and decide — see `so100_builder/core/validate.py`'s `WARN_OUT_OF_PLANE_TILT` |
+| **Out-of-plane tilt** | ⚠ **Corrected 2026-07-28 (ROS2 doc §9.4) — this IS reachable**, contrary to what this row used to say. Still comparatively untested territory (relative to a full self-collision model), so worth a second look. | Warn (not a hard error), with the offending angle, so the user can "Check By Eye" and decide — see `so100_builder/core/validate.py`'s `WARN_OUT_OF_PLANE_TILT` |
 
 ---
 
@@ -480,20 +880,15 @@ for stick in order:
     reachable?        -> closed-form IK, exhaustive over both elevation
                           branches and both elbow branches, each candidate
                           verified by round-tripping through fk() (ROS2 doc
-                          §9.3; §9.4's "tool axis must stay in the arm plane"
-                          governs the TOOL, not the stick -- an out-of-plane
-                          STICK tilt is reachable, see §9.4's correction)
+                          Sec 9.3/9.6; Sec 9.4's "tool axis must stay in the
+                          arm plane" governs the TOOL, not the stick -- an
+                          out-of-plane STICK tilt is reachable, see Sec 9.4's
+                          correction)
     jaw clearance?    -> swept jaw box vs. already-placed sticks [Phase C]
     within envelope?  -> cached reachability map [viewport overlay only]
     -> verdict (+ a warning, not a hard fail, for an out-of-plane tilt --
        still comparatively untested territory), then add to the scene
 ```
-
-✅ **Phase B implemented (2026-07-28) as permissive**, decided with the user:
-trust the closed-form IK's own success/failure, including for out-of-plane
-tilts (§9.4's correction). MoveIt re-validates on load regardless, so an
-over-eager Blender-side rejection only costs a design iteration for nothing.
-See `so100_builder/README.md`'s Phase B section for the full derivation.
 
 Per-stick verdicts drive everything the user sees: list icons, viewport
 colours, and a summary (`42 sticks · 38 buildable · 4 impossible`). Reasons
@@ -503,6 +898,12 @@ height"` rather than `"unreachable"`.
 ⚠ **This is an upper bound, not a guarantee.** It does not model self-collision
 of the whole arm, the mount platform, or MoveIt's own path planning. ROS2
 re-validates on load and MoveIt has the final word.
+
+✅ **Phase B implemented (2026-07-28) as permissive**, decided with the user:
+trust the closed-form IK's own success/failure, including for out-of-plane
+tilts (§9.4's correction). MoveIt re-validates on load regardless, so an
+over-eager Blender-side rejection only costs a design iteration for nothing.
+See `so100_builder/README.md`'s Phase B section for the full derivation.
 
 ---
 
@@ -525,9 +926,13 @@ def blender_to_robot(vec_world, base_matrix_world, scale_length):
 ## 9. Scene data model
 
 ### 9.1 Conventions
-- An empty named **`SO100_Base`** (scene pointer property) marks `base_link`.
-  Moving it repositions the whole design relative to the robot without
-  re-authoring anything.
+- An empty (scene pointer property, `props.base_empty`) marks the selected
+  robot's own URDF root frame — named per robot by `ops/design.py`'s
+  `Create Robot Base` operator (§4a): `SO100_Base` for so_arm_100 (its own
+  `base_link`), `KR10_Base` for kr10_r900_2 (its own `base`, a different
+  name for the same *role* — see that package's own README). Moving it
+  repositions the whole design relative to the robot without re-authoring
+  anything.
 - The wireframe mesh object is designated by a scene pointer property.
 - The **build volume** is drawn as a reference box:
   ✅ **240 × 160 × 200 mm centred at Y = −370 mm** — i.e. X ∈ [−120, +120],
@@ -562,10 +967,12 @@ positions or maintain an explicit id layer):
 
 ## 10. UI specification
 
-3D View sidebar (`N` panel), category **SO-100**:
+3D View sidebar (`N` panel), category **RA130** (the addon's own name --
+renamed from "SO-100" 2026-08-23, since multi-robot support means the addon
+is no longer specific to that one robot; see `docs/STATUS.md`):
 
 ### 10.1 `Design`
-`SO100_Base` picker · mesh picker · stock section (6.45 mm) · length mode
+Robot picker (§4a) · robot base picker · mesh picker · stock section (6.45 mm) · length mode
 (§5.3) · joint allowance · **Extract Sticks** · summary counts.
 
 ### 10.2 `Plan`
@@ -597,6 +1004,60 @@ a wrong command is impossible, plus a red **Abort**.
 Keep the GPU overlay in its own module with a hard on/off switch — draw
 handlers are the most common cause of addon crashes across Blender versions.
 
+### 10.5 ✅ Localization — Japanese (added 2026-08-24)
+
+User request: "is it possible to add a second language to the addon GUI? or
+it would require a reload? ... can you add japanese as a second language."
+Uses Blender's own addon-localization mechanism
+(`bpy.app.translations.register(__name__, translations_dict)`), not
+anything this addon invents — every panel label, button, checkbox, dropdown
+option and tooltip is already plain text passed to `bpy.types.UILayout`/
+`bpy.props.*` calls, and Blender's own UI-drawing code runs each one
+through its own translation lookup automatically once a matching
+`(msgctxt, english_text) -> translated_text` entry is registered.
+
+**No reload needed to switch languages.** Confirmed directly against this
+exact Blender build (5.2.0 LTS) by registering a probe dict, setting
+`bpy.context.preferences.view.language = "ja_JP"`, and reading translated
+strings back via `bpy.app.translations.pgettext()` — switching Preferences
+> Interface > Translation > Language is instant and live; the addon's own
+code only needs to load ONCE (same as any other code change) for its
+translations to be registered at all.
+
+New `i18n.py` module: a single `_JA` dict plus `register()`/`unregister()`,
+wired into `__init__.py`'s own `_MODULES` tuple. **Scope, deliberately:**
+panel titles, section/box headers, button labels, checkbox/dropdown labels,
+property names, dropdown option names, and operator/property tooltips are
+all translated — the vast majority of what a user actually sees scanning
+the UI. **Not translated:** anything built from runtime data (`"%d
+stick(s) impossible"`, `self.report(...)` messages, validation "reason"
+strings) — Blender's translation lookup is an exact string match on the
+msgid, and by the time a `%`-formatted string reaches `layout.label
+(text=...)` the runtime value is already baked in, so there is no fixed
+string to register a translation against; making these translatable too
+would mean wrapping every format call in `ui/panels.py` with an explicit
+`pgettext_iface()` on the TEMPLATE before substitution, a larger refactor
+not attempted here. Also not translated: anything inside `core/`, which
+stays pure Python with no `bpy` import at all (constraint B4) — adding
+translation calls there would violate that boundary for a UI concern that
+belongs in `ui/`/`ops/` anyway, so `core/validate.py`'s "reason" strings
+stay English regardless of language. Everything else in the codebase —
+comments, docstrings, identifiers — stays English, the project's own
+primary language, per the user's own instruction. Only `ja_JP` exists
+today; the dict shape supports adding more locales as additional top-level
+keys without touching anything else.
+
+New `TestTranslations` (`test_blender_integration.py`, needs the real,
+registered addon — not a copy of the dict) confirms a panel title, a
+property name, and an operator label all translate correctly with
+`language = "ja_JP"`, that nothing translates with English, and spot-
+checks several real operator labels against the dict so a rename without a
+matching translation update is caught. A drive-by fix along the way: the
+Reference panel's `"98%% reachable..."` label was passed straight to
+`layout.label(text=...)` with no `%`-substitution ever applied to it, so
+the UI was literally showing a doubled `%%` — found while surveying every
+UI string for translation; corrected to a single `%`.
+
 ---
 
 ## 11. Implementation phases
@@ -610,17 +1071,25 @@ handlers are the most common cause of addon crashes across Blender versions.
 - **Done when:** a wireframe cube produces 12 sticks with correct metre
   coordinates in `base_link` and correct stick lengths, verified by hand.
 
-### Phase B — Kinematics & validation
-- [ ] Vendor `so_arm_100_kinematics` — ✅ **it exists, is tested, and is
-      validated on real hardware**; it ships alongside these docs. Follow the
-      vendoring rules in that package's own `README.md` (copy the inner
-      module dir + `VERSION`, not the ROS packaging files; never fork it).
-- [ ] Write `kinematics_version` into every exported build file and check it
+### Phase B — Kinematics & validation — ✅ DONE 2026-07-28
+- [x] Vendor `so_arm_100_kinematics` — **exists, tested, validated on real
+      hardware**, now including `grasp.py` (v1.1.0 — the grasp-orientation
+      transform, ROS2 doc §9.6). Follow the vendoring rules in that
+      package's own `README.md` (copy the inner module dir + `VERSION`, not
+      the ROS packaging files; never fork it).
+- [x] Write `kinematics_version` into every exported build file and check it
       on import, per [`BRIDGE_PROTOCOL.md`](BRIDGE_PROTOCOL.md) Part A.
-- [ ] `core/validate.py`; per-stick verdicts with specific reasons.
-- [ ] Viewport overlay: build volume, reachability, status colours.
+- [x] `core/validate.py`; per-stick verdicts with specific reasons. Calls
+      `grasp.solve_stick_orientation()` directly rather than reimplementing
+      it — see the Phase D note below on why that matters.
+- [x] Viewport overlay: build volume, reachability, status colours.
 - **Done when:** dragging a vertex outside the envelope turns that stick red
   with a specific reason, live, with no ROS running.
+
+✅ **Decided permissive** (see §7's note below): trust the closed-form IK's
+own success/failure, including for out-of-plane tilts — MoveIt re-validates
+on load regardless, so an over-eager rejection here only costs a design
+iteration for nothing.
 
 ### Phase C — Build order — ✅ DONE 2026-07-29
 - [x] `core/order.py` per §6, including the §6.2 warnings.
@@ -660,20 +1129,54 @@ must be re-run after any re-extraction.**
   in-`.blend` progress, syncing, and checking the right sticks come back
   `placed`.
 
-⚠ **Integration gap to close before that hardware run.** ROS2 re-validates the
-build file with the shared kinematics module — but the transform that turns
-`base`/`tip` into the `(tool_elevation_rad, stick_roll_rad)` pair `ik()`
-consumes is **not in that shared module.** It lives in the addon
-(`core/validate.py`), and ROS2's own Phase 1 checklist still marks it "not
-written yet". That derivation is where three separate sign/branch bugs were
-found during Phase B, so an independent reimplementation on the ROS2 side is
-a realistic way for the two to disagree about where a stick goes — precisely
-the failure the shared-module design exists to prevent. **Recommendation:
-promote it into `so_arm_100_kinematics`, bump the version, re-vendor.**
+✅ **Integration gap closed (2026-07-31).** ROS2 re-validates the build file
+with the shared kinematics module — the transform that turns `base`/`tip`
+into the `(tool_elevation_rad, stick_roll_rad)` pair `ik()` consumes used to
+live only in the addon (`core/validate.py`), with ROS2's own Phase 1
+checklist marking it "not written yet". That derivation is where three
+separate sign/branch bugs were found during Phase B, so an independent
+reimplementation on the ROS2 side would have been a realistic way for the
+two sides to disagree about where a stick goes — precisely the failure the
+shared-module design exists to prevent. It is now promoted into
+`so_arm_100_kinematics.grasp` (version 1.1.0), re-vendored into
+`so100_builder/kinematics/grasp.py`, and `core/validate.py` calls it rather
+than reimplementing it — see the Blender addon workspace's own
+`so100_builder/README.md`, "The grasp-orientation transform" section, for
+the full derivation and test coverage (that section lives in the addon
+repo, not this one — `so_arm_100_kinematics/README.md` here only summarizes
+it). **The ROS2 workspace's own copy has been updated to match**
+(`so_arm_100_kinematics` 1.1.0, 30/30 tests passing there too) — this is no
+longer outstanding.
 
-### Phase E — Preview & polish
-- [ ] Robot mirror rig driven by the shared FK; scrub through the build order.
-- [ ] *(If Option A/telemetry chosen)* the `net/` layer and live status.
+### Phase E — Preview & polish — ✅ DONE 2026-07-31 (telemetry N/A, Option C has none)
+- [x] Robot mirror rig driven by the shared FK; scrub through the build order.
+      `core/mirror.py` (pure, testable): ``joint_frames()`` derives all 6
+      joint-chain points (base_link origin through the true TCP) entirely
+      from the vendored, tested ``chain.fk()`` -- called on successively
+      longer joint-angle prefixes, correcting for the one place ``fk()``'s
+      own postprocessing (the `EE_OFFSET` add) is only valid for the full
+      chain. Not a second FK implementation; see the module's own docstring.
+      `ops/mirror.py` reads a stick's base/tip back off the build mesh
+      (respecting any `flip`), solves it with
+      `kinematics.grasp.solve_stick_placement()` -- the exact function
+      `PlaceStick` uses on the ROS2 side -- and poses a preview-only mesh
+      object (`SO100_Mirror`, never selectable, never rendered) with the
+      resulting 6 points. `SO100_PT_preview` (Sec 10.4) adds the toggle and
+      prev/next scrub controls. No telemetry, no live robot link -- Option C
+      (Sec 2) has none by design, and none was wanted here.
+- [x] *(Option A/telemetry chosen)* — N/A, not applicable under Option C.
+
+**Done when:** tested three ways, per Sec 12's own layering — `core/mirror.py`
+against the vendored `fk()` directly (a segment-length invariance property
+across 5 named poses + 200 random joint-space samples, so a bug in the
+`EE_OFFSET` correction would show up as a length that moves with the pose);
+`ops/mirror.py`'s operators executed for real inside Blender (toggle,
+wrap-around stepping, object cleanup on unregister, and a geometric check
+that the rig's TCP point lands within 1 mm of the stick's own
+`grasp_target()` -- not just "drew something"); and the new `Preview`
+panel's `draw()` itself smoke-tested in a real **windowed** Blender instance
+(background mode cannot fire panel draw callbacks at all), since a typo in a
+`layout.prop()`/`operator()` call is invisible to every other test layer.
 
 ---
 
