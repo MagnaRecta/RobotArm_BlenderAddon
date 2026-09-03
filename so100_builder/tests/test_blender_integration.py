@@ -312,6 +312,30 @@ class TestBuildMesh(BlenderTestCase):
         self.assertEqual(self.props.build_mesh.name, first)
         self.assertEqual(len(self.props.build_mesh.data.edges), 12)
 
+    def test_clear_results_also_deletes_the_build_mesh(self):
+        # 2026-08-24 user request: a stale build mesh left over after
+        # clearing is never useful -- Extract Sticks always regenerates
+        # one from scratch.
+        props = self.extract(ground_mode="SLIDE")
+        name = props.build_mesh.name
+        self.assertIn(name, bpy.data.objects)
+
+        self.assertEqual(bpy.ops.so100.clear_results(), {"FINISHED"})
+        self.assertIsNone(props.build_mesh)
+        self.assertNotIn(name, bpy.data.objects)
+        self.assertNotIn(name, bpy.data.meshes)
+
+    def test_a_fresh_build_mesh_is_generated_after_clearing(self):
+        props = self.extract(ground_mode="SLIDE")
+        bpy.ops.so100.clear_results()
+        props = self.extract(ground_mode="SLIDE")
+        self.assertIsNotNone(props.build_mesh)
+        self.assertEqual(len(props.build_mesh.data.edges), 12)
+
+    def test_clear_results_is_a_clean_no_op_without_a_build_mesh_yet(self):
+        self.assertEqual(bpy.ops.so100.clear_results(), {"FINISHED"})
+        self.assertIsNone(self.props.build_mesh)
+
 
 @unittest.skipIf(bpy is None, "requires Blender")
 class TestStockLengthMode(BlenderTestCase):
@@ -869,7 +893,14 @@ class TestMultiRobot(BlenderTestCase):
         import tempfile
         from so100_builder.core import robots as core_robots
 
-        self.extract(robot_id="kr10_r900_2", ground_mode="SLIDE")
+        # +20mm compensates kr10_r900_2's own -20mm default plate height
+        # (its mounting-pedestal floor, ops/design.py's own
+        # effective_ground_height_m()) so the shared cube fixture (built
+        # grounded at Z=0, same as every other robot's own default) still
+        # grounds here too -- this test is about export stamping the right
+        # robot/version, not about plate-height behaviour itself.
+        self.extract(robot_id="kr10_r900_2", ground_mode="SLIDE",
+                     build_plate_height_mm=20.0)
         path = os.path.join(tempfile.mkdtemp(), "kuka.build.json")
         result = bpy.ops.so100.export_build_file(filepath=path)
         self.assertEqual(result, {"FINISHED"})
@@ -895,9 +926,14 @@ class TestMultiRobot(BlenderTestCase):
         bpy.ops.wm.read_factory_settings(use_empty=True)
         props = bpy.context.scene.so100
         half, length, gap, y = 0.055, 0.110, 0.0065, -0.550
+        # Grounded at kr10_r900_2's own default plate height (-20mm, its
+        # mounting-pedestal floor -- ops/design.py's own
+        # effective_ground_height_m()), not Z=0 -- Z=0 would sit 20mm
+        # ABOVE the plate by default and read as a floating component.
+        z0 = -0.02
         verts, edges = [], []
         for level in range(3):
-            z = level * (length + gap)
+            z = z0 + level * (length + gap)
             verts.extend([(-half, y, z), (half, y, z)])
         for level in range(2):
             base = level * 2
@@ -921,6 +957,125 @@ class TestMultiRobot(BlenderTestCase):
         self.assertGreater(len(props.sticks), 0)
         for item in props.sticks:
             self.assertGreaterEqual(item.order, 0, item.reason)
+
+
+@unittest.skipIf(bpy is None, "requires Blender")
+class TestEffectiveGroundHeight(BlenderTestCase):
+    """ops.design.effective_ground_height_m() -- 2026-08-24 user request:
+    "move that box... make the bottom of that box the build plate
+    reference height". build_plate_height_mm is an OFFSET above each
+    robot's own confirmed build-volume floor, not an absolute Z."""
+
+    def test_so_arm_100_default_is_zero_unchanged(self):
+        from so100_builder.core import robots as core_robots
+        from so100_builder.ops.design import effective_ground_height_m
+
+        profile = core_robots.get_robot("so_arm_100")
+        self.assertAlmostEqual(
+            effective_ground_height_m(profile, self.props), 0.0, places=9)
+
+    def test_kr10_default_matches_its_own_build_volume_floor(self):
+        from so100_builder.core import robots as core_robots
+        from so100_builder.ops.design import effective_ground_height_m
+
+        profile = core_robots.get_robot("kr10_r900_2")
+        self.props.robot_id = "kr10_r900_2"
+        self.assertAlmostEqual(
+            effective_ground_height_m(profile, self.props), -0.02, places=9)
+
+    def test_a_nonzero_offset_adds_to_the_robots_own_floor(self):
+        from so100_builder.core import robots as core_robots
+        from so100_builder.ops.design import effective_ground_height_m
+
+        profile = core_robots.get_robot("kr10_r900_2")
+        self.props.robot_id = "kr10_r900_2"
+        self.props.build_plate_height_mm = 50.0
+        self.assertAlmostEqual(
+            effective_ground_height_m(profile, self.props), 0.03, places=9)
+
+    def test_the_overlay_box_and_extraction_ground_height_always_agree(self):
+        # The two were previously independent numbers; this is the
+        # specific inconsistency the user's request closes.
+        from so100_builder.core import robots as core_robots
+        from so100_builder.ops.design import effective_ground_height_m
+        from so100_builder.ui.overlay import _volume_box_points
+
+        profile = core_robots.get_robot("kr10_r900_2")
+        self.props.robot_id = "kr10_r900_2"
+        self.props.build_plate_height_mm = 35.0
+        ground_height_m = effective_ground_height_m(profile, self.props)
+
+        identity = ((1.0, 0.0, 0.0, 0.0), (0.0, 1.0, 0.0, 0.0),
+                   (0.0, 0.0, 1.0, 0.0), (0.0, 0.0, 0.0, 1.0))
+        points = _volume_box_points(
+            identity, 1.0, "kr10_r900_2",
+            self.props.build_plate_height_mm / 1000.0)
+        box_bottom = min(p[2] for p in points)
+        self.assertAlmostEqual(box_bottom, ground_height_m, places=9)
+
+
+@unittest.skipIf(bpy is None, "requires Blender")
+class TestDropToBuildPlate(BlenderTestCase):
+    """so100.drop_to_build_plate -- 2026-08-24 user request: "a button
+    that 'drops' a mesh having its lower vertex touch that bottom face or
+    the build plate. This way I can ensure the shape is touching the build
+    plate."."""
+
+    def _lowest_robot_z(self):
+        from so100_builder.core import transform as core_transform
+
+        props = self.props
+        base_matrix = core_transform.to_tuple_4x4(props.base_empty.matrix_world)
+        scale_length = bpy.context.scene.unit_settings.scale_length
+        world_points = [tuple(props.design_mesh.matrix_world @ v.co)
+                        for v in props.design_mesh.data.vertices]
+        robot_points = core_transform.blender_to_robot_batch(
+            world_points, base_matrix, scale_length)
+        return min(p[2] for p in robot_points)
+
+    def test_poll_fails_without_a_design_mesh(self):
+        self.props.design_mesh = None
+        self.assertFalse(bpy.ops.so100.drop_to_build_plate.poll())
+
+    def test_dropping_an_already_grounded_mesh_is_a_no_op(self):
+        # The default wireframe cube already sits at Z=0, so_arm_100's own
+        # default plate height -- nothing to move.
+        self.assertEqual(bpy.ops.so100.drop_to_build_plate(), {"FINISHED"})
+        self.assertAlmostEqual(self._lowest_robot_z(), 0.0, places=6)
+
+    def test_dropping_a_floating_mesh_grounds_it(self):
+        self.design.location.z += 0.30  # world-space nudge, base empty is at identity
+        bpy.context.view_layer.update()  # matrix_world lags .location until flushed
+        self.assertAlmostEqual(self._lowest_robot_z(), 0.30, places=6)
+        self.assertEqual(bpy.ops.so100.drop_to_build_plate(), {"FINISHED"})
+        self.assertAlmostEqual(self._lowest_robot_z(), 0.0, places=6)
+
+    def test_dropping_a_mesh_below_the_plate_raises_it(self):
+        self.design.location.z -= 0.05
+        bpy.context.view_layer.update()
+        self.assertEqual(bpy.ops.so100.drop_to_build_plate(), {"FINISHED"})
+        self.assertAlmostEqual(self._lowest_robot_z(), 0.0, places=6)
+
+    def test_dropping_onto_a_raised_kr10_plate(self):
+        # kr10_r900_2's own default floor is -20mm (its mounting pedestal);
+        # raising build_plate_height_mm by 40mm makes the effective plate
+        # height -0.02 + 0.04 = 0.02.
+        self.props.robot_id = "kr10_r900_2"
+        self.props.build_plate_height_mm = 40.0
+        self.assertEqual(bpy.ops.so100.drop_to_build_plate(), {"FINISHED"})
+        self.assertAlmostEqual(self._lowest_robot_z(), 0.02, places=6)
+
+    def test_drop_moves_the_object_not_the_mesh_data(self):
+        self.design.location.z += 0.10
+        bpy.context.view_layer.update()
+        original_translation = tuple(self.design.matrix_world.translation)
+        bpy.ops.so100.drop_to_build_plate()
+        bpy.context.view_layer.update()
+        self.assertNotEqual(
+            tuple(self.design.matrix_world.translation), original_translation)
+        # Mesh data (local vertex coordinates) is untouched -- only the
+        # object moved.
+        self.assertAlmostEqual(self.design.data.vertices[0].co.z, 0.0, places=6)
 
 
 @unittest.skipIf(bpy is None, "requires Blender")
@@ -1032,6 +1187,31 @@ class TestOverlayBuildVolume(unittest.TestCase):
         self.assertEqual([round(v, 6) for v in lo], [-0.16, -0.16, -0.02])
         self.assertEqual([round(v, 6) for v in hi], [0.16, 0.16, 0.0])
 
+    def test_plate_offset_moves_the_box_2026_08_24(self):
+        # User request: "I want to be able to move that box from the
+        # addon" -- plate_offset_m (props.build_plate_height_mm in
+        # metres) shifts the box's own Z, X/Y unchanged.
+        from so100_builder.ui.overlay import _volume_box_points
+
+        default = _volume_box_points(self.IDENTITY, 1.0, "kr10_r900_2")
+        raised = _volume_box_points(self.IDENTITY, 1.0, "kr10_r900_2",
+                                    plate_offset_m=0.05)
+        lo0, hi0 = self._bounds(default)
+        lo1, hi1 = self._bounds(raised)
+        self.assertAlmostEqual(lo1[2] - lo0[2], 0.05, places=9)
+        self.assertAlmostEqual(hi1[2] - hi0[2], 0.05, places=9)
+        for axis in (0, 1):
+            self.assertAlmostEqual(lo1[axis], lo0[axis], places=9)
+            self.assertAlmostEqual(hi1[axis], hi0[axis], places=9)
+
+    def test_plate_offset_defaults_to_no_movement(self):
+        from so100_builder.ui.overlay import _volume_box_points
+
+        with_default_arg = _volume_box_points(self.IDENTITY, 1.0, "kr10_r900_2")
+        with_explicit_zero = _volume_box_points(
+            self.IDENTITY, 1.0, "kr10_r900_2", plate_offset_m=0.0)
+        self.assertEqual(with_default_arg, with_explicit_zero)
+
     def test_so_arm_100_has_no_base_box_to_draw(self):
         from so100_builder.ui.overlay import _base_box_points
 
@@ -1056,6 +1236,152 @@ class TestSelectStickInViewport(BlenderTestCase):
         bm.edges.ensure_lookup_table()
         selected = [e.index for e in bm.edges if e.select]
         self.assertEqual(selected, [5])
+        bpy.ops.object.mode_set(mode="OBJECT")
+
+    def _highlighted_points(self, props):
+        from so100_builder.ui.overlay import _selected_edge_indices, _selected_edge_points
+
+        return _selected_edge_points(props, _selected_edge_indices(props))
+
+    def test_selected_edge_is_highlighted_after_check_by_eye(self):
+        # 2026-08-24 user request: highlight the selected edge in a
+        # different colour. _selected_edge_points() (ui/overlay.py) reads
+        # live edit-mode selection -- unlike the actual GPU draw, this
+        # plain bmesh read works fine under --background.
+        props = self.extract(ground_mode="SLIDE")
+        props.active_stick_index = 5
+        bpy.ops.so100.select_stick_in_viewport()
+
+        points = self._highlighted_points(props)
+        self.assertEqual(len(points), 2)  # one edge = 2 endpoints
+
+        obj = props.build_mesh
+        bm = bmesh.from_edit_mesh(obj.data)
+        bm.edges.ensure_lookup_table()
+        expected_edge = bm.edges[5]
+        expected = {tuple(expected_edge.verts[0].co), tuple(expected_edge.verts[1].co)}
+        self.assertEqual(set(points), expected)
+        bpy.ops.object.mode_set(mode="OBJECT")
+
+    def test_highlight_follows_a_different_edge_selected_by_hand(self):
+        # "revert it when the user clicks something else in the viewer" --
+        # simulated here as a direct bmesh selection change, since this
+        # sandbox cannot simulate an actual viewport click.
+        props = self.extract(ground_mode="SLIDE")
+        props.active_stick_index = 5
+        bpy.ops.so100.select_stick_in_viewport()
+
+        obj = props.build_mesh
+        bm = bmesh.from_edit_mesh(obj.data)
+        bm.edges.ensure_lookup_table()
+        for edge in bm.edges:
+            edge.select = False
+        bm.edges[2].select = True
+        bmesh.update_edit_mesh(obj.data)
+
+        points = self._highlighted_points(props)
+        expected = {tuple(bm.edges[2].verts[0].co), tuple(bm.edges[2].verts[1].co)}
+        self.assertEqual(set(points), expected)
+        bpy.ops.object.mode_set(mode="OBJECT")
+
+    def test_highlight_clears_when_the_user_deselects(self):
+        props = self.extract(ground_mode="SLIDE")
+        props.active_stick_index = 5
+        bpy.ops.so100.select_stick_in_viewport()
+        self.assertNotEqual(self._highlighted_points(props), [])
+
+        bpy.ops.mesh.select_all(action="DESELECT")
+        self.assertEqual(self._highlighted_points(props), [])
+        bpy.ops.object.mode_set(mode="OBJECT")
+
+    def test_highlight_is_empty_outside_edit_mode(self):
+        props = self.extract(ground_mode="SLIDE")
+        props.active_stick_index = 5
+        bpy.ops.so100.select_stick_in_viewport()
+        bpy.ops.object.mode_set(mode="OBJECT")
+        self.assertEqual(self._highlighted_points(props), [])
+
+    def _previous_points(self, props):
+        from so100_builder.ui.overlay import _previous_edge_points, _selected_edge_indices
+
+        return _previous_edge_points(props, _selected_edge_indices(props))
+
+    def test_highlight_previous_sticks_is_off_by_default(self):
+        self.assertFalse(self.props.highlight_previous_sticks)
+
+    def test_previous_edge_points_uses_extraction_order_without_a_build_order(self):
+        # 2026-08-24 user request: "a checkbox before the check by eye
+        # button that makes all the previous edges highlighted." No build
+        # order yet -- falls back to extraction order, matching
+        # SO100_OT_step_stick's own fallback.
+        props = self.extract(ground_mode="SLIDE")
+        props.active_stick_index = 5
+        bpy.ops.so100.select_stick_in_viewport()
+
+        points = self._previous_points(props)
+        self.assertEqual(len(points), 2 * 5)  # edges 0..4, 2 endpoints each
+
+        mesh = props.build_mesh.data
+        expected = set()
+        for i in range(5):
+            for v in mesh.edges[i].vertices:
+                expected.add(tuple(mesh.vertices[v].co))
+        self.assertEqual(set(points), expected)
+        bpy.ops.object.mode_set(mode="OBJECT")
+
+    def test_previous_edge_points_is_empty_for_the_first_stick(self):
+        props = self.extract(ground_mode="SLIDE")
+        props.active_stick_index = 0
+        bpy.ops.so100.select_stick_in_viewport()
+        self.assertEqual(self._previous_points(props), [])
+        bpy.ops.object.mode_set(mode="OBJECT")
+
+    def test_previous_edge_points_uses_build_order_once_one_exists(self):
+        self.assertEqual(bpy.ops.so100.compute_build_order(), {"FINISHED"})
+        props = self.props
+        # Pick a stick that is neither first nor last in BUILD order --
+        # its own predecessors by build order and by raw edge index are
+        # different sets whenever the two orders actually differ (true
+        # for this cube: the top ring can only be placed after the
+        # bottom one, regardless of which edge id either got).
+        current = next(item for item in props.sticks if 0 < item.order < 11)
+        current_index = list(props.sticks).index(current)
+        props.active_stick_index = current_index
+        self.assertEqual(bpy.ops.so100.select_stick_in_viewport(), {"FINISHED"})
+
+        points = self._previous_points(props)
+        expected_ids = {item.stick_id for item in props.sticks
+                        if item.order >= 0 and item.order < current.order}
+        mesh = props.build_mesh.data
+        expected = set()
+        for i, item in enumerate(props.sticks):
+            if item.stick_id in expected_ids:
+                for v in mesh.edges[i].vertices:
+                    expected.add(tuple(mesh.vertices[v].co))
+        self.assertEqual(set(points), expected)
+        self.assertGreater(len(expected_ids), 0)
+        bpy.ops.object.mode_set(mode="OBJECT")
+
+    def test_previous_edge_points_is_empty_with_nothing_selected(self):
+        props = self.extract(ground_mode="SLIDE")
+        props.active_stick_index = 5
+        bpy.ops.so100.select_stick_in_viewport()
+        bpy.ops.mesh.select_all(action="DESELECT")
+        self.assertEqual(self._previous_points(props), [])
+        bpy.ops.object.mode_set(mode="OBJECT")
+
+    def test_previous_edge_points_is_empty_with_multiple_selected(self):
+        props = self.extract(ground_mode="SLIDE")
+        props.active_stick_index = 5
+        bpy.ops.so100.select_stick_in_viewport()
+
+        obj = props.build_mesh
+        bm = bmesh.from_edit_mesh(obj.data)
+        bm.edges.ensure_lookup_table()
+        bm.edges[2].select = True
+        bmesh.update_edit_mesh(obj.data)
+
+        self.assertEqual(self._previous_points(props), [])
         bpy.ops.object.mode_set(mode="OBJECT")
 
     def test_build_mesh_is_locked_again_after_the_next_extraction(self):

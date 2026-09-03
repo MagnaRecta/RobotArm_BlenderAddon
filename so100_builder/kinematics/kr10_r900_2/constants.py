@@ -59,11 +59,36 @@ GRIPPER_TCP_Z_M = 0.0805
 # --- Grasp / stick geometry -------------------------------------------------
 # Axial offset from the stick's BASE end (the physical stop,
 # KUKA_IMPLEMENTATION_PLAN.md KQ5) to the point the jaws close on, along the
-# stick's own axis. Derived 2026-08-21 from compute_fk of gripper_tcp at the
-# hand-tuned 'lower' pose vs. the physical-stop coordinate -- NOT yet
-# confirmed with a ruler; see KUKA_IMPLEMENTATION_PLAN.md Sec 3 Phase 2 for
-# the full derivation (including a ~1.25mm unexplained Y residual).
-GRASP_OFFSET_M = 0.0188
+# stick's own axis. Originally derived 2026-08-21 from compute_fk of
+# gripper_tcp at the hand-tuned 'lower' pose vs. the physical-stop
+# coordinate then assumed for pick_and_place.yaml's steps.stick.base_xyz_m
+# -- NOT yet confirmed with a ruler; see KUKA_IMPLEMENTATION_PLAN.md Sec 3
+# Phase 2 for that original derivation.
+#
+# Re-derived 2026-09-02 (0.0188 -> 0.021072): real-hardware finding -- every
+# PLACED stick landed ~2mm off, traced to base_xyz_m's assumed physical
+# stop being ~2mm short of the real one (corrected there, 0.0665 ->
+# 0.0685m on X) -- this constant, derived FROM that assumption, inherited
+# the same 2mm error into every placement computed from it (grasp_target/
+# grasped_stick_center -- NOT the feeder grasp itself: pregrasp/lower are
+# independent, hand-tuned joint targets, never derived from this constant).
+#
+# NOTE: an earlier same-day revision of this comment (0.023050) used the
+# WRONG 'lower' pose for this recomputation -- a transcription slip, not a
+# real hardware retune (pick_and_place.yaml's 'lower' has NOT changed since
+# 2026-08-25; confirmed via `git diff HEAD -- .../pick_and_place.yaml`
+# showing zero delta on that line). Recomputed again here from the ACTUAL,
+# unchanged 'lower':
+#     fk(lower_rad)'s gripper_tcp X, at pick_and_place.yaml's real
+#     'lower' pose (-83.45, -32.25, 126.35, 173.05, 3.55, 148.04) deg:
+#     (0.047428, 0.399898, 0.021598)
+#     GRASP_OFFSET_M = corrected_base_xyz_m.x - tcp.x
+#                     = 0.0685 - 0.047428 = 0.021072
+# Off-axis residual at this pose: Y -0.10mm, Z -1.90mm (unexplained, same
+# spirit as the original derivation's own "not yet confirmed with a ruler"
+# caveat -- re-verify against real hardware, not just this recomputation,
+# before fully trusting it).
+GRASP_OFFSET_M = 0.021072
 
 # Jaw geometry, from this project's earlier gripper CAD analysis (finger
 # mesh bounding box 23.65 x 15.39 x 36.8 mm -- see
@@ -83,8 +108,8 @@ MIN_GRASP_OFFSET_M = 0.010
 # the same fixed vertical-hole location regardless of stick length." Unlike
 # SO-100 (where the grip point is chosen per-stick, up from whichever
 # stick's own base), grasp_offset_for_length() is therefore NOT needed for
-# Phase 1's feeder grasp -- GRASP_OFFSET_M (18.8mm) plus
-# JAW_CONTACT_HALF_LENGTH_M (8mm) = 26.8mm sits safely inside even the
+# Phase 1's feeder grasp -- GRASP_OFFSET_M (21.07mm as of 2026-09-02) plus
+# JAW_CONTACT_HALF_LENGTH_M (8mm) = 29.07mm sits safely inside even the
 # shortest allowed stick (35mm, STICK_LENGTH_RANGE_M below) with margin to
 # spare. The function is still provided (mirroring so_arm_100_kinematics'
 # public API) for Phase 5's general stick-placement grasp, where a stick may

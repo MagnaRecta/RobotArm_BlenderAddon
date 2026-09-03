@@ -268,14 +268,19 @@ class SO100SceneProps(PropertyGroup):
     build_plate_height_mm: FloatProperty(
         name="Build Plate Height", default=0.0,
         min=0.0, max=1000.0, precision=1,
-        description="The physical build plate's own Z, in the selected robot's "
-                    "base frame. 0 (default) matches every design so far. The "
-                    "plate is height-adjustable, so a design that sits entirely "
-                    "above Z=0 -- reported as a floating component -- is not "
-                    "necessarily unbuildable, just unbuildable at the plate's "
-                    "CURRENT height here. Raise this to the component's own "
-                    "lowest point (named in the error) to treat it as resting "
-                    "on the plate",
+        description="How far the physical build plate is raised ABOVE the "
+                    "selected robot's own confirmed build-volume floor -- "
+                    "0 (default) is that floor itself, which is where the "
+                    "viewport build-volume box already starts (Z=0 for "
+                    "so_arm_100, -20mm for kr10_r900_2's own mounting "
+                    "pedestal). Moving this moves that box's bottom face by "
+                    "the same amount -- the two are always the same value. "
+                    "A design that sits entirely above the plate's current "
+                    "height -- reported as a floating component -- is not "
+                    "necessarily unbuildable, just unbuildable at THIS "
+                    "height. Raise this to the component's own lowest point "
+                    "(named in the error), or use Drop to Build Plate to "
+                    "move the design mesh to the plate instead",
     )
 
     # --- results ------------------------------------------------------------
@@ -297,6 +302,15 @@ class SO100SceneProps(PropertyGroup):
         name="Show Overlay", default=True,
         description="GPU viewport overlay: build volume + per-stick status colours "
                     "(Sec 10.4). Hard off switch -- kept in its own module",
+    )
+    highlight_previous_sticks: BoolProperty(
+        name="Highlight Previous Sticks", default=False,
+        description="Check By Eye also highlights every stick that comes before "
+                    "the current one -- in build order once one is computed, "
+                    "otherwise extraction order -- so the path already built up "
+                    "to this point is visible at a glance. Off by default: only "
+                    "the current stick is highlighted, same as before this "
+                    "existed",
     )
 
     # --- Phase E: robot mirror (Sec 10.4) -----------------------------------

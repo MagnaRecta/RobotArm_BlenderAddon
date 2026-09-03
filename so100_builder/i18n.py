@@ -228,27 +228,48 @@ _JA = {
     (_D, "A vertex within this distance of the build plate seats on it"):
         "ビルドプレートからこの距離以内にある頂点は接地しているとみなされます",
     (_D, "Build Plate Height"): "ビルドプレート高さ",
-    (_D, "The physical build plate's own Z, in the selected robot's "
-        "base frame. 0 (default) matches every design so far. The "
-        "plate is height-adjustable, so a design that sits entirely "
-        "above Z=0 -- reported as a floating component -- is not "
-        "necessarily unbuildable, just unbuildable at the plate's "
-        "CURRENT height here. Raise this to the component's own "
-        "lowest point (named in the error) to treat it as resting "
-        "on the plate"):
-        "選択中ロボットのベースフレームにおける、実際のビルドプレート自体の"
-        "Z座標。既定値の0はこれまでの全デザインと一致します。プレートは"
-        "高さを調整できるため、Z=0より完全に上にあるデザイン（「浮いている"
-        "部品」として報告される）は必ずしも構築不可能ではなく、現在の"
-        "プレートの高さでは構築できないだけです。この値をその部品自身の"
-        "最下点（エラーメッセージに記載）まで上げると、プレートに接地して"
-        "いるものとして扱われます",
+    (_D, "How far the physical build plate is raised ABOVE the "
+        "selected robot's own confirmed build-volume floor -- "
+        "0 (default) is that floor itself, which is where the "
+        "viewport build-volume box already starts (Z=0 for "
+        "so_arm_100, -20mm for kr10_r900_2's own mounting "
+        "pedestal). Moving this moves that box's bottom face by "
+        "the same amount -- the two are always the same value. "
+        "A design that sits entirely above the plate's current "
+        "height -- reported as a floating component -- is not "
+        "necessarily unbuildable, just unbuildable at THIS "
+        "height. Raise this to the component's own lowest point "
+        "(named in the error), or use Drop to Build Plate to "
+        "move the design mesh to the plate instead"):
+        "実際のビルドプレートが、選択中ロボット自身の確定済みビルドボリューム"
+        "の床面からどれだけ上げられているか -- 既定値の0はその床面自体を"
+        "表し、これはビューポートのビルドボリュームボックスが既に開始して"
+        "いる位置と同じです（so_arm_100はZ=0、kr10_r900_2は自身の取り付け"
+        "台の分だけZ=-20mm）。この値を変更すると、そのボックスの底面も"
+        "同じ量だけ動きます -- 両者は常に同じ値です。プレートの現在の高さ"
+        "より完全に上にあるデザイン（「浮いている部品」として報告される）は"
+        "必ずしも構築不可能ではなく、この高さでは構築できないだけです。"
+        "この値をその部品自身の最下点（エラーメッセージに記載）まで上げる"
+        "か、「ビルドプレートに落とす」を使ってデザインメッシュをプレートへ"
+        "移動してください",
     (_D, "Show Overlay"): "オーバーレイを表示",
     (_D, "GPU viewport overlay: build volume + per-stick status colours "
         "(Sec 10.4). Hard off switch -- kept in its own module"):
         "GPUビューポートオーバーレイ：ビルドボリュームとスティックごとの"
         "ステータス色（セクション10.4）。完全にオフにできるスイッチで、"
         "独立したモジュールに保持されています",
+    (_D, "Highlight Previous Sticks"): "以前のスティックをハイライト",
+    (_D, "Check By Eye also highlights every stick that comes before "
+        "the current one -- in build order once one is computed, "
+        "otherwise extraction order -- so the path already built up "
+        "to this point is visible at a glance. Off by default: only "
+        "the current stick is highlighted, same as before this "
+        "existed"):
+        "目視確認で、現在のスティックより前のすべてのスティックも"
+        "ハイライトします -- 組み立て順序が計算済みならその順序で、"
+        "そうでなければ抽出順序で判定します -- これにより、この時点までに"
+        "既に組み立てた経路を一目で確認できます。既定ではオフで、この機能が"
+        "追加される前と同様に現在のスティックのみがハイライトされます",
     (_D, "Show Robot Mirror"): "ロボットミラーを表示",
     (_D, "A rig posed by the vendored FK, showing the arm at the "
         "current build-order position -- a printer-style preview "
@@ -284,6 +305,11 @@ _JA = {
     (_D, "Advanced"): "詳細設定",
 
     # --- ops/design.py ---------------------------------------------------
+    (_OP, "Drop to Build Plate"): "ビルドプレートに落とす",
+    (_OP, "Move the design mesh so its lowest vertex touches the "
+         "build plate's own current height (Build Plate Height)"):
+        "デザインメッシュの最下点がビルドプレートの現在の高さ"
+        "（ビルドプレート高さ）に接するように移動します",
     (_OP, "Create Robot Base"): "ロボットベースを作成",
     (_OP, "Add an Empty marking the selected robot's own URDF root "
          "frame and point the addon at it. Move it to reposition "
@@ -318,8 +344,10 @@ _JA = {
         "フレーム表示します",
     (_OP, "Step Stick"): "スティックを移動",
     (_OP, "Clear Results"): "結果をクリア",
-    (_OP, "Discard the extracted sticks and their state"):
-        "抽出したスティックとその状態を破棄します",
+    (_OP, "Discard the extracted sticks and their state, and delete "
+         "the build mesh -- Extract Sticks regenerates a fresh one"):
+        "抽出したスティックとその状態を破棄し、ビルドメッシュも削除します"
+        " -- スティック抽出を実行すると新しいものが生成されます",
 
     # --- ops/order.py ------------------------------------------------------
     (_OP, "Compute Build Order"): "組み立て順序を計算",

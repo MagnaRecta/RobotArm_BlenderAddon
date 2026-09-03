@@ -44,6 +44,15 @@ BUILD_MESH_NAMES = {
     core_robots.KR10_R900_2_ID: "KR10_BuildMesh",
 }
 
+# Check By Eye (2026-08-24 user feedback): view3d.view_selected() frames a
+# single edge edge-to-edge with no margin, so tight it is hard to tell
+# where in the wider structure that stick actually sits. Stepping the
+# camera back by this factor after framing (region_3d.view_distance is
+# multiplied, not set to an absolute value, so it scales with however
+# large the design already is) keeps the stick centred but pulls enough of
+# its neighbours into view to read the surrounding context at a glance.
+CHECK_BY_EYE_ZOOM_MARGIN = 2.0
+
 
 def base_empty_name(robot_id):
     return BASE_EMPTY_NAMES.get(robot_id, BASE_EMPTY_NAME)
@@ -51,6 +60,36 @@ def base_empty_name(robot_id):
 
 def build_mesh_name(robot_id):
     return BUILD_MESH_NAMES.get(robot_id, BUILD_MESH_NAME)
+
+
+def effective_ground_height_m(profile, props):
+    """The build plate's own Z, in ``profile``'s robot frame -- 2026-08-24
+    user request: "move that box... make the bottom of that box the build
+    plate reference height".
+
+    ``props.build_plate_height_mm`` is an OFFSET above THIS robot's own
+    confirmed build-volume floor (``profile.build_volume_min_m[2]``), not
+    an absolute Z -- so it defaults (0.0mm offset) to the physically
+    correct plate height for every registered robot without a per-robot
+    property default, which the Blender property system cannot express
+    (properties.py's own established workaround elsewhere is an explicit
+    "reset to this robot's defaults" button; this needs no such button,
+    since 0.0 is already correct for every robot by construction). For
+    so_arm_100 (``build_volume_min_m[2] == 0.0``) this is numerically
+    identical to treating it as an absolute Z, unchanged from before this
+    existed. For kr10_r900_2 (``build_volume_min_m[2] == -0.02``, the
+    robot's own 20mm mounting pedestal -- core/robots.py's own
+    ``base_box_min_m``/``max_m`` note) the default plate height is now
+    correctly -20mm instead of 0mm, matching the viewport build-volume box
+    (``ui/overlay.py``) exactly -- the two were previously independent
+    numbers that happened to only agree for so_arm_100.
+
+    Falls back to the raw offset (the old absolute-Z behaviour) for a
+    robot with no confirmed build volume at all, since there is no
+    profile floor to offset from.
+    """
+    baseline = profile.build_volume_min_m[2] if profile.has_build_volume else 0.0
+    return baseline + props.build_plate_height_mm / 1000.0
 
 
 def _report_error(operator, message):
@@ -202,6 +241,7 @@ def extract_with_autoflip(context, props):
     """
     stock = props.stock_lengths_m()
     points_m, edge_pairs, edge_ids, reassigned = read_design_mesh(context, props)
+    profile = core_robots.get_robot(props.robot_id)
 
     extract_kwargs = dict(
         robot_id=props.robot_id,
@@ -214,7 +254,7 @@ def extract_with_autoflip(context, props):
         section_m=props.section_mm / 1000.0,
         merge_tolerance_m=props.merge_tolerance_mm / 1000.0,
         ground_epsilon_m=props.ground_epsilon_mm / 1000.0,
-        ground_height_m=props.build_plate_height_mm / 1000.0,
+        ground_height_m=effective_ground_height_m(profile, props),
         ground_required=props.require_build_plate,
         residual_tolerance_m=props.residual_tolerance_mm / 1000.0,
     )
@@ -415,6 +455,78 @@ def rebuild_build_mesh(context, props, result):
 
 
 # --- operators ---------------------------------------------------------------
+
+
+class SO100_OT_drop_to_build_plate(Operator):
+    """Move the design mesh straight down (or up) so its lowest vertex
+    touches the build plate -- 2026-08-24 user request: "a button that
+    'drops' a mesh having its lower vertex touch that bottom face or the
+    build plate. This way I can ensure the shape is touching the build
+    plate."
+
+    Moves the OBJECT (``matrix_world``'s own translation), never mesh
+    data -- reversible with a plain undo/redo like any other object move,
+    and never touches the stable-id attribute layer extraction depends on.
+    The shift is computed as a single delta along the ROBOT's own Z axis
+    (``core.transform``'s ``robot_to_blender`` applied to two points and
+    differenced), not assumed to be a pure world-Z move -- correct even if
+    the base empty itself is rotated relative to world space.
+    """
+
+    bl_idname = "so100.drop_to_build_plate"
+    bl_label = "Drop to Build Plate"
+    bl_description = ("Move the design mesh so its lowest vertex touches the "
+                      "build plate's own current height (Build Plate Height)")
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        props = context.scene.so100
+        return (
+            props.design_mesh is not None
+            and props.base_empty is not None
+            and props.design_mesh.mode == "OBJECT"
+            and len(props.design_mesh.data.vertices) > 0
+        )
+
+    def execute(self, context):
+        props = context.scene.so100
+        obj = props.design_mesh
+        base_matrix = core_transform.to_tuple_4x4(props.base_empty.matrix_world)
+        scale_length = context.scene.unit_settings.scale_length
+
+        points_world = [tuple(obj.matrix_world @ v.co) for v in obj.data.vertices]
+        try:
+            points_m = core_transform.blender_to_robot_batch(
+                points_world, base_matrix, scale_length)
+        except core_transform.SingularMatrix as exc:
+            return _report_error(self, str(exc))
+
+        profile = core_robots.get_robot(props.robot_id)
+        target_z = effective_ground_height_m(profile, props)
+        lowest_z = min(p[2] for p in points_m)
+        delta_m = target_z - lowest_z
+
+        if abs(delta_m) < 1e-6:
+            self.report({"INFO"}, "Already touching the build plate")
+            return {"FINISHED"}
+
+        try:
+            p0 = core_transform.robot_to_blender((0.0, 0.0, 0.0), base_matrix, scale_length)
+            p1 = core_transform.robot_to_blender((0.0, 0.0, delta_m), base_matrix, scale_length)
+        except core_transform.SingularMatrix as exc:
+            return _report_error(self, str(exc))
+
+        obj.matrix_world.translation.x += p1[0] - p0[0]
+        obj.matrix_world.translation.y += p1[1] - p0[1]
+        obj.matrix_world.translation.z += p1[2] - p0[2]
+
+        self.report(
+            {"INFO"},
+            "Moved %.1f mm to touch the build plate at Z=%.1f mm"
+            % (delta_m * 1000.0, target_z * 1000.0),
+        )
+        return {"FINISHED"}
 
 
 class SO100_OT_create_base_empty(Operator):
@@ -624,6 +736,15 @@ class SO100_OT_select_stick_in_viewport(Operator):
             if region is not None:
                 with context.temp_override(area=area, region=region):
                     bpy.ops.view3d.view_selected()
+                # Step the camera back after framing (2026-08-24 user
+                # feedback: too tight to tell where the stick sits in the
+                # wider structure) -- see CHECK_BY_EYE_ZOOM_MARGIN's own
+                # comment for why this multiplies view_distance rather
+                # than repeating the zoom operator or setting an absolute
+                # distance.
+                space = area.spaces.active
+                if space is not None and space.region_3d is not None:
+                    space.region_3d.view_distance *= CHECK_BY_EYE_ZOOM_MARGIN
 
         return {"FINISHED"}
 
@@ -676,7 +797,8 @@ class SO100_OT_step_stick(Operator):
 class SO100_OT_clear_results(Operator):
     bl_idname = "so100.clear_results"
     bl_label = "Clear Results"
-    bl_description = "Discard the extracted sticks and their state"
+    bl_description = ("Discard the extracted sticks and their state, and delete "
+                      "the build mesh -- Extract Sticks regenerates a fresh one")
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -687,11 +809,26 @@ class SO100_OT_clear_results(Operator):
         props.design_dimensions_mm = ""
         props.expanded_dimensions_mm = ""
         props.topology_signature = ""
-        self.report({"INFO"}, "Cleared extracted sticks (stable ids are kept)")
+
+        # 2026-08-24 user request: a stale build mesh left lying around
+        # after clearing is never useful -- Extract Sticks always
+        # regenerates one from scratch (ops/design.py's own
+        # rebuild_build_mesh(), which creates a new object exactly when
+        # props.build_mesh is None), never edits it in place.
+        obj = props.build_mesh
+        if obj is not None and obj.name in bpy.data.objects:
+            mesh = obj.data
+            bpy.data.objects.remove(obj)
+            bpy.data.meshes.remove(mesh)
+        props.build_mesh = None
+
+        self.report(
+            {"INFO"}, "Cleared extracted sticks and the build mesh (stable ids are kept)")
         return {"FINISHED"}
 
 
 _CLASSES = (
+    SO100_OT_drop_to_build_plate,
     SO100_OT_create_base_empty,
     SO100_OT_reset_stock_to_robot_defaults,
     SO100_OT_extract_sticks,

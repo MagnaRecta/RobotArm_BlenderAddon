@@ -130,6 +130,7 @@ class SO100_PT_design(SO100PanelBase, Panel):
         if props.require_build_plate:
             box.prop(props, "ground_mode", text="Ground")
             box.prop(props, "build_plate_height_mm")
+            box.operator("so100.drop_to_build_plate", icon="TRIA_DOWN_BAR")
         else:
             box.label(
                 text="No plate check -- you supply the support", icon="INFO")
@@ -412,6 +413,7 @@ class SO100_PT_sticks(SO100PanelBase, Panel):
 
             box.prop(item, "flip")
 
+            box.prop(props, "highlight_previous_sticks")
             row = box.row(align=True)
             row.operator("so100.step_stick", text="", icon="TRIA_LEFT").direction = -1
             row.operator("so100.select_stick_in_viewport", text="Check By Eye",

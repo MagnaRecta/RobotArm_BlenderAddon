@@ -1058,6 +1058,197 @@ Reference panel's `"98%% reachable..."` label was passed straight to
 the UI was literally showing a doubled `%%` — found while surveying every
 UI string for translation; corrected to a single `%`.
 
+### 10.6 ✅ The build-volume box is movable, and it and grounding always agree (added 2026-08-24)
+
+User request: "There is a box showing the build volume. I want to be able
+to move that box from the addon, and then make the bottom of that box the
+build plate reference height... I would want a button that 'drops' a mesh
+having its lower vertex touch that bottom face or the build plate."
+
+**Found while implementing this:** `ui/overlay.py`'s build-volume box and
+`ops/design.py`'s own grounding math (`ground_height_m`, threaded into
+`core/sticks.py`/`core/order.py` since §10.5's predecessor entry) were two
+INDEPENDENT numbers that only happened to agree for so_arm_100. The box
+always drew at the robot profile's own fixed `build_volume_min_m/max_m`;
+`props.build_plate_height_mm` (default 0.0, absolute Z) never moved it at
+all. For kr10_r900_2 specifically this was a real, silent inconsistency:
+the box's own Z was corrected to `[-20, 280]` mm (its mounting-pedestal
+floor, §4a's own entry) but the DEFAULT grounding computation was never
+updated to match, so a design built at the robot's own coordinate origin
+(Z=0, matching every other robot's convention) would silently be treated
+as floating 20mm above the plate it looks like it is standing on.
+
+**Fixed by reinterpreting `build_plate_height_mm`'s own meaning**: an
+OFFSET above the SELECTED robot's own confirmed build-volume floor, not an
+absolute Z. New `ops.design.effective_ground_height_m(profile, props)` =
+`profile.build_volume_min_m[2] + build_plate_height_mm/1000` (falling back
+to the raw offset for a robot with no confirmed build volume at all, since
+there is no floor to offset from). For so_arm_100 (`build_volume_min_m[2]
+== 0.0`) this is numerically identical to the old absolute-Z behaviour,
+unchanged; for kr10_r900_2 the DEFAULT grounding height is now correctly
+-20mm instead of 0mm, closing the inconsistency above with no button press
+needed (0.0mm offset is already physically correct for every robot by
+construction — properties.py's usual "reset to this robot's own defaults"
+workaround for Blender's lack of per-robot property defaults is not needed
+here). `ops/design.py::extract_with_autoflip()` and
+`ops/order.py::build_solver()` both resolve `ground_height_m` through this
+helper now instead of reading `build_plate_height_mm` directly.
+
+**"Move that box"**: `ui/overlay.py`'s `_volume_box_points()` gained a
+`plate_offset_m` parameter (`props.build_plate_height_mm` in metres) that
+shifts the box's own Z by the same amount `effective_ground_height_m()`
+adds — so editing that ONE field (Design panel, Mesh Expansion box) both
+moves the visible box AND sets where the design must ground, by
+construction, rather than two things that could disagree. (X/Y stay fixed
+at the profile's own position; only Z is meaningful here, since nothing
+downstream reads an X/Y build-volume offset — moving the box sideways
+would be purely cosmetic with no functional effect on validation, so it
+was deliberately left out of scope rather than half-implemented.)
+
+**The drop button**: new `so100.drop_to_build_plate` operator (Design
+panel, right under the Build Plate Height field) moves the DESIGN MESH
+OBJECT (never its mesh data — reversible with a plain undo, like any other
+object move) so its lowest vertex touches `effective_ground_height_m()`
+exactly. Computes the shift as a single delta along the ROBOT's own Z axis
+(`core.transform.robot_to_blender` applied to two points and differenced,
+not assumed to be a pure world-Z move — correct even if the base empty is
+itself rotated relative to world space), converts every design-mesh vertex
+into the robot's own frame the same way extraction already does
+(`core.transform.blender_to_robot_batch`), and reports how far it moved.
+This directly replaces the "move the cube down ~6.4mm by hand" workaround
+from the original `~/KUKABlenderTest.blend` diagnosis (§4a, "the design
+cube's lowest vertex sits at Z=6.4mm relative to KR10_Base") with a single
+button press.
+
+New `TestEffectiveGroundHeight` and `TestDropToBuildPlate`
+(`test_blender_integration.py`) cover the helper directly, confirm the
+overlay box and `effective_ground_height_m()` always report the exact same
+number for a given `build_plate_height_mm`, and exercise the drop operator
+end to end (already-grounded is a no-op, a floating mesh gets grounded, a
+mesh below the plate gets raised, a raised kr10_r900_2 plate is honoured,
+and only the object moves, never mesh data). Two existing kr10_r900_2
+fixtures (`TestMultiRobot`'s export test and its standalone build-order
+test) were built grounded at the OLD Z=0 assumption and needed updating to
+the new -20mm default floor — not a regression, the intended effect of the
+fix; 442/442 in both bare CPython and real Blender.
+
+### 10.7 ✅ Clear Results also deletes the build mesh (added 2026-08-24)
+
+User request: "when clicking on the trashcan icon next to the extract
+sticks, can you make it so it also deletes the build mesh? since a new one
+has to be generated again?" `ops.design.SO100_OT_clear_results` (the
+Design panel's trashcan button, next to Extract Sticks) previously only
+cleared `props.sticks` and the summary/dimension strings, leaving
+`props.build_mesh` — a real object in the scene — behind, stale, with
+nothing pointing at it once `props.sticks` was empty. Since
+`rebuild_build_mesh()` always regenerates a fresh build mesh from scratch
+on the next extraction (never edits one in place), there was never a
+reason to keep the old one around. Now removes the object AND its mesh
+datablock (`bpy.data.objects.remove()` / `bpy.data.meshes.remove()`, the
+same pattern `ops/mirror.py`'s own cleanup already uses for its rig mesh)
+and sets `props.build_mesh = None`, guarded by the same "does it still
+exist" check used elsewhere (`rebuild_build_mesh()`'s own). New tests in
+`test_blender_integration.py::TestBuildMesh` confirm the object and its
+mesh data are both actually gone from `bpy.data` (not just unlinked from
+the property), that a later extraction still regenerates a working build
+mesh, and that clearing with no build mesh yet is a clean no-op; 445/445
+in both bare CPython and real Blender.
+
+### 10.8 ✅ Check By Eye steps the camera back after framing (added 2026-08-24)
+
+User feedback: "can you make it so the camera appears a bit more far
+away? It is difficult to grasp where in the mesh is that edge if the
+camera is too close." `SO100_OT_select_stick_in_viewport`'s
+`view3d.view_selected()` call frames the selected stick's edge edge-to-
+edge with no margin — tight enough that the surrounding structure falls
+outside the viewport, so there is nothing to judge the stick's position
+against. After framing, the operator now multiplies the 3D viewport's own
+`region_3d.view_distance` by `CHECK_BY_EYE_ZOOM_MARGIN` (2.0) — a relative
+step-back, not an absolute distance, so it scales correctly whether the
+design is a 100mm test cube or a metre-scale sculpture, and stays centred
+on the stick rather than recentring on the whole design. Applies equally
+to `SO100_OT_step_stick` (Sticks panel's arrow buttons), which already
+calls this same operator internally.
+
+⚠ **Not verified visually in this sandbox** (same GPU/windowed-mode
+limitation as `ui/overlay.py`'s own docstring, and windowed-Blender
+smoke-testing attempts earlier in this project's history) — but confirmed
+working by the user directly, in their own real Blender: "The camera
+looks fine now."
+
+### 10.9 ✅ Check By Eye highlights the selected edge, and reverts on its own (added 2026-08-24)
+
+User request: "can you highlight the selected edge in a different color?
+And revert it when the user clicks something else in the viewer?" Edit
+Mode's own native selection highlight already shows which edge is
+selected, but the user wanted something more distinct.
+
+New `ui/overlay.py::_selected_edge_points(props)`, drawn in `_draw()` on
+top of the per-stick status colours in bright yellow
+(`_SELECTED_EDGE_COLOR`, width `_SELECTED_EDGE_WIDTH` = 4.0, thicker than
+the status lines' own 2.0). **The "revert on its own" half needed no new
+machinery at all**: the function reads the build mesh's CURRENT edit-mode
+selection live via `bmesh.from_edit_mesh()` on every call, and the draw
+handler already re-fires on every viewport redraw — which Blender already
+triggers after every click. So selecting a different edge by hand, or
+clicking empty space to deselect entirely, is already reflected the very
+next redraw with zero event handling, no modal operator, and no extra
+scene property tracking "which edge Check By Eye chose" — exactly the
+kind of design Sec 10.4's own warning about draw handlers argues for
+(minimal state, nothing that can go stale). Returns `[]` (nothing drawn)
+whenever the build mesh is not currently in Edit Mode, which
+`bmesh.from_edit_mesh` would otherwise raise on — Check By Eye is what
+puts it there in the first place, so exiting Edit Mode is itself already
+"clicking something else" and clears the highlight for free.
+
+Unlike the GPU drawing itself (module docstring's own note, unverifiable
+under `--background`), `_selected_edge_points()` is a plain bmesh read
+that works fine in background mode — new tests confirm it returns exactly
+the edge Check By Eye selected, follows a DIFFERENT edge selected by hand
+(simulating "the user clicks something else in the viewer", since this
+sandbox cannot simulate an actual viewport click), clears on deselect, and
+is empty outside Edit Mode; 449/449 in both bare CPython and real Blender.
+The actual on-screen colour/thickness still could not be checked visually
+here.
+
+### 10.10 ✅ "Highlight Previous Sticks" checkbox (added 2026-08-24)
+
+User request: "a checkbox before the check by eye button that makes all
+the previous edges highlighted... when it isn't selected, the process
+will be the same as it currently is."
+
+New `properties.py`'s `highlight_previous_sticks` (`BoolProperty`, default
+`False` — unchecked behaves exactly as §10.9, unchanged), a checkbox in
+the Sticks panel right before the Check By Eye row. `ui/overlay.py`
+refactored §10.9's own `_selected_edge_points()` to take a pre-computed
+list of selected-edge indices (`_selected_edge_indices()`, new, still one
+live `bmesh.from_edit_mesh` read) rather than querying the live bmesh
+itself, so a new `_previous_edge_points()` can share that SAME query
+instead of reading the bmesh a second time per redraw. "Previous" means
+BUILD order (`item.order`) once one has been computed, falling back to
+extraction order otherwise — the exact same fallback
+`SO100_OT_step_stick` already uses (§10.4's own entry), so "previous"
+means the same thing here as it does when stepping through the list.
+Drawn in a muted gold (`_PREVIOUS_EDGE_COLOR`, same hue family as the
+current edge's bright yellow but visibly dimmer and at width 3.0 vs. the
+current edge's 4.0 — deliberately NOT reusing `_STATUS_COLOR`'s own
+orange for `STATUS_FAILED`, to avoid reading as "these sticks failed"),
+drawn before the current edge so the current one stays the most visually
+prominent. Only activates for EXACTLY one selected edge — with zero or
+several selected, "the current one" is ambiguous, so nothing extra draws
+(ordinary selection highlighting still shows whatever IS selected either
+way).
+
+Like `_selected_edge_points()`, `_previous_edge_points()` is a plain
+mesh/bmesh read with no GPU calls, so — unlike the actual on-screen
+drawing — it is directly testable under `--background`. New tests cover
+the extraction-order fallback, the build-order case (using a stick that
+is neither first nor last, on the wireframe-cube fixture where the two
+orders provably differ), the empty-for-the-first-stick edge case, and
+that it goes empty with zero or multiple edges selected; 455/455 in both
+bare CPython and real Blender. The actual on-screen appearance still
+could not be checked visually here.
+
 ---
 
 ## 11. Implementation phases

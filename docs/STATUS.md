@@ -212,6 +212,120 @@ Format: `[owning side]` short description — pointer.
 
 ## Resolved
 
+- `[Blender]` **"Highlight Previous Sticks" checkbox, 2026-08-24** — user
+  request: "a checkbox before the check by eye button that makes all the
+  previous edges highlighted... when it isn't selected, the process will
+  be the same as it currently is." New `highlight_previous_sticks`
+  property (default off, unchanged behaviour when unchecked). "Previous"
+  means build order once one exists, falling back to extraction order --
+  the same fallback `SO100_OT_step_stick` already uses. Drawn in a muted
+  gold, dimmer than the current edge's bright yellow, only when EXACTLY
+  one edge is selected (ambiguous otherwise). `ui/overlay.py`'s own
+  `_selected_edge_points()` (the prior entry below) was refactored to take
+  a pre-computed selected-index list so the new `_previous_edge_points()`
+  can share the same live bmesh read rather than querying it twice per
+  redraw. Like that prior work, this is a plain mesh/bmesh read with no
+  GPU calls, so directly testable under `--background` -- new tests cover
+  both the extraction-order and build-order cases (the latter using a
+  stick where the two orders provably differ), the first-stick edge case,
+  and the zero/multiple-selected ambiguous cases; 455/455 in both bare
+  CPython and real Blender. On-screen appearance not verified visually
+  here.
+
+- `[Blender]` **Check By Eye steps the camera back after framing,
+  2026-08-24** — user feedback: "can you make it so the camera appears a
+  bit more far away? It is difficult to grasp where in the mesh is that
+  edge if the camera is too close." `view3d.view_selected()` frames the
+  selected stick edge-to-edge with no margin; the operator now multiplies
+  the viewport's own `region_3d.view_distance` by
+  `CHECK_BY_EYE_ZOOM_MARGIN` (2.0, `ops/design.py`) right after framing --
+  a relative step-back that scales with the design's own size and keeps
+  the stick centred, rather than an absolute distance. Applies to
+  `SO100_OT_step_stick` too, which already calls this same operator.
+  **Not verified visually in this sandbox** (same GPU/windowed-mode
+  limitation as the overlay's own docstring) -- confirmed working by the
+  user directly: "The camera looks fine now."
+
+- `[Blender]` **Check By Eye highlights the selected edge, and reverts on
+  its own, 2026-08-24** -- user request: "can you highlight the selected
+  edge in a different color? And revert it when the user clicks something
+  else in the viewer?" New `ui/overlay.py::_selected_edge_points()`, drawn
+  in bright yellow on top of the per-stick status colours. The "revert on
+  its own" half needed no new machinery: the function reads the build
+  mesh's CURRENT edit-mode selection live via `bmesh.from_edit_mesh()` on
+  every draw call, and the draw handler already re-fires on every redraw
+  (which Blender already triggers after every click) -- so selecting a
+  different edge by hand, or deselecting entirely, already shows up the
+  very next redraw with zero event handling, no modal operator, and no
+  extra scene property. Unlike the GPU drawing itself, this read is plain
+  bmesh access that works in background mode -- new tests confirm it
+  tracks the selected edge, follows a hand-selected different one,
+  clears on deselect, and is empty outside Edit Mode; 449/449 in both
+  bare CPython and real Blender. The actual on-screen colour still
+  couldn't be checked visually in this sandbox.
+
+- `[Blender]` **Clear Results (the trashcan button) now also deletes the
+  build mesh, 2026-08-24** — user: "when clicking on the trashcan icon
+  next to the extract sticks, can you make it so it also deletes the
+  build mesh? since a new one has to be generated again?" Previously left
+  the old build mesh object sitting in the scene, stale, with nothing
+  pointing at it once the sticks list was cleared -- `rebuild_build_mesh()`
+  always regenerates a fresh one on the next extraction anyway, so there
+  was never a reason to keep it. `SO100_OT_clear_results` now removes both
+  the object and its mesh datablock (`bpy.data.objects.remove()`/
+  `bpy.data.meshes.remove()`, the same pattern `ops/mirror.py`'s own rig
+  cleanup already used) and clears `props.build_mesh`. New tests confirm
+  both are actually gone from `bpy.data`, a later extraction still
+  regenerates cleanly, and clearing with nothing to clear is a no-op;
+  445/445 in both bare CPython and real Blender.
+
+- `[shared]` **`kr10_r900_2_kinematics` re-vendored a third time,
+  2026-08-24** (user: "Please revendor the kinematics" -- resolving the
+  drift flagged as Open the same day). A real, hardware-confirmed
+  calibration correction, not just a comment/rename: `GRASP_OFFSET_M`
+  moved from 0.0188 to 0.021072 (a ~2.3mm correction) -- "real-hardware
+  finding -- every PLACED stick landed ~2mm off, traced to base_xyz_m's
+  assumed physical stop being ~2mm short of the real one." Only
+  `constants.py` differed from the last re-vendor; re-copied it verbatim
+  and confirmed no test in this addon relied on the old value (nothing
+  hardcodes `GRASP_OFFSET_M`'s own number, only reads it off the vendored
+  module) -- `test_vendor_sync.py::TestVendoredCopyIsVerbatim` passes
+  again with no other code changes needed; 442/442 in both bare CPython
+  and real Blender.
+
+- `[Blender]` **The build-volume box is movable, and now always agrees
+  with grounding, 2026-08-24** — user: "I want to be able to move that
+  box from the addon, and then make the bottom of that box the build
+  plate reference height... a button that 'drops' a mesh having its lower
+  vertex touch that bottom face or the build plate." Found while
+  implementing: the viewport box (`ui/overlay.py`) and the actual
+  grounding computation (`ground_height_m`) were two INDEPENDENT numbers
+  that only happened to agree for so_arm_100 -- for kr10_r900_2, the box's
+  own Z was corrected to account for its 20mm mounting pedestal (an
+  earlier 2026-08-23 entry) but the DEFAULT grounding height was never
+  updated to match, so a design built at Z=0 (every robot's usual
+  convention) silently read as floating 20mm above the plate it looks
+  like it's standing on. Fixed by reinterpreting `build_plate_height_mm`
+  as an OFFSET above the selected robot's own confirmed build-volume
+  floor rather than an absolute Z (`ops.design.effective_ground_height_m()`,
+  new) -- identical to the old behaviour for so_arm_100 (whose own floor
+  is already Z=0), but now correctly -20mm by default for kr10_r900_2,
+  with no button press needed since 0.0mm offset is already right for
+  every robot by construction. The SAME field now also moves the viewport
+  box's own Z (`_volume_box_points()` gained `plate_offset_m`) -- editing
+  it moves the box and sets where the design must ground in the same
+  action, closing the inconsistency for good. New `so100.
+  drop_to_build_plate` operator (Design panel button) moves the design
+  mesh OBJECT (never mesh data, undo-safe) so its lowest vertex touches
+  that height exactly -- the same fix an earlier session applied by hand
+  ("move the cube down ~6.4mm") to `~/KUKABlenderTest.blend`, now one
+  button press. Two existing kr10_r900_2 test fixtures needed updating to
+  the new -20mm default floor (not a regression, the intended effect).
+  New `TestEffectiveGroundHeight`/`TestDropToBuildPlate` in
+  `test_blender_integration.py`; 442/442 in both bare CPython and real
+  Blender (aside from the unrelated, still-drifting vendor-sync entry
+  above).
+
 - `[Blender]` **Japanese added as a second UI language, 2026-08-24** —
   user: "is it possible to add a second language to the addon GUI? ...
   can you add japanese." Uses Blender's own `bpy.app.translations`

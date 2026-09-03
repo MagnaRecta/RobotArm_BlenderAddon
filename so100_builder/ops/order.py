@@ -22,9 +22,11 @@ from bpy.props import IntProperty
 from bpy.types import Operator
 
 from ..core import order as core_order
+from ..core import robots as core_robots
 from ..core import transform as core_transform
 from .design import (
     check_design_ready,
+    effective_ground_height_m,
     extract_with_autoflip,
     ordered_ids,
     rebuild_build_mesh,
@@ -50,10 +52,11 @@ def build_solver(context, props):
     guarantees the order is computed against the settings as they are *now*.
     """
     result, verdicts, auto_flipped, _reassigned = extract_with_autoflip(context, props)
+    profile = core_robots.get_robot(props.robot_id)
     solver = core_order.OrderSolver(
         result.sticks,
         ground_epsilon_m=props.ground_epsilon_mm / 1000.0,
-        ground_height_m=props.build_plate_height_mm / 1000.0,
+        ground_height_m=effective_ground_height_m(profile, props),
         ground_required=props.require_build_plate,
         backtrack_limit=props.backtrack_limit,
         robot_id=props.robot_id,
