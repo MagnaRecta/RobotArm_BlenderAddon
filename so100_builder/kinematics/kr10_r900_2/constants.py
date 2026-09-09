@@ -48,13 +48,29 @@ JOINT_NAMES = tuple(entry[0] for entry in CHAIN)
 # Three fixed (non-actuated) transforms in series, all read directly off the
 # URDF -- gripper_clock_joint (mount clocking), gripper_mount_joint (mesh
 # alignment), gripper_tcp_joint (the derived TCP offset, see
-# KUKA_IMPLEMENTATION_PLAN.md Sec 3 Phase 2 for how its z=0.0805m was
-# back-solved). Folded into one constant (translation, rotation) pair by
+# KUKA_IMPLEMENTATION_PLAN.md Sec 3 Phase 2 for how its original z=0.0805m
+# was back-solved). Folded into one constant (translation, rotation) pair by
 # chain.py at import time -- see TOOL_OFFSET_XYZ_M / TOOL_OFFSET_ROT below.
 GRIPPER_CLOCK_ANGLE_RAD = math.radians(-45.0)
 GRIPPER_CLOCK_XYZ_M = (0.03, 0.0, 0.0)
 GRIPPER_MOUNT_PITCH_RAD = math.radians(90.0)
-GRIPPER_TCP_Z_M = 0.0805
+
+# GRIPPER_TCP_Z_M -- re-derived 2026-09-09 after the 2026-09-04 finger STL
+# swap (kr10_r900_2_description.urdf.xacro's own gripper_tcp_joint comment
+# has the full derivation: both old/new finger meshes' local Z start at the
+# same 48.2mm mounting end, but the new mesh's tip is only 79.5mm out vs.
+# the old mesh's 85.0mm -- 5.5mm shorter). Real-hardware/RViz finding: the
+# held/placed stick rendered visibly lower than the physical new, shorter
+# fingers reach. Lowered 2mm (0.0805 -> 0.0785) per the user's own visual
+# judgement, not the full 5.5mm a tip-relative rederivation would suggest --
+# revisit (up to that 5.5mm figure) if it still looks low.
+#
+# A further 1mm taken off 2026-09-09 (0.0785 -> 0.0775), same reasoning --
+# still short of the 5.5mm ceiling, still just the user's own visual call,
+# not a rederivation. Must always match the xacro's own gripper_tcp_joint
+# origin z (this module's own "no other source of truth" rule, module
+# docstring).
+GRIPPER_TCP_Z_M = 0.0775
 
 # --- Grasp / stick geometry -------------------------------------------------
 # Axial offset from the stick's BASE end (the physical stop,
@@ -88,30 +104,72 @@ GRIPPER_TCP_Z_M = 0.0805
 # spirit as the original derivation's own "not yet confirmed with a ruler"
 # caveat -- re-verify against real hardware, not just this recomputation,
 # before fully trusting it).
-GRASP_OFFSET_M = 0.021072
 
-# Jaw geometry, from this project's earlier gripper CAD analysis (finger
-# mesh bounding box 23.65 x 15.39 x 36.8 mm -- see
-# kr10_r900_2_description/meshes/*/gripper_*.stl). Which raw bbox dimension
-# maps to "along the stick axis" vs. "the jaws' own radial reach" was not
-# independently re-measured against the mesh's own local axes while writing
-# this file -- both constants below are therefore rougher estimates than
-# GRASP_OFFSET_M above, in the same spirit as so_arm_100_kinematics'
-# JAW_RADIUS_M/JAW_CONTACT_HALF_LENGTH_M (see that package's own README
-# caveats). Confirm against real hardware or a fresh mesh-axis check before
-# trusting either for a real build.
-JAW_CONTACT_HALF_LENGTH_M = 0.008
-MIN_GRASP_OFFSET_M = 0.010
+# Recalibrated 2026-09-09 after GRIPPER_TCP_Z_M's own 2026-09-09 re-derivation
+# (see that constant's own comment) shifted where fk() places gripper_tcp at
+# every pose, including 'lower'. Recomputed via this same section's own
+# formula at pick_and_place.yaml's live 'lower' pose (-83.62, -32.33, 126.72,
+# 174.62, 4.45, 147.31) deg and stick.base_xyz_m (0.067229, 0.400186,
+# 0.024080): new tcp.x = 0.046149, GRASP_OFFSET_M = 0.067229 - 0.046149 =
+# 0.021080 (was 0.021065 before GRIPPER_TCP_Z_M's first change).
+#
+# Recalibrated again 2026-09-09, same day, after GRIPPER_TCP_Z_M's further
+# 1mm reduction (0.0785 -> 0.0775): new tcp.x = 0.046142, GRASP_OFFSET_M =
+# 0.067229 - 0.046142 = 0.021087.
+GRASP_OFFSET_M = 0.021087
+
+# Jaw geometry -- re-derived 2026-09-05 after a gripper finger STL swap
+# (kr10_r900_2_description/meshes/{visual,collision}/gripper_{left,right}_finger.stl;
+# old meshes kept alongside as old_gripper_*_finger.stl). Unlike when this
+# section was first written, WHICH mesh axis is "along the stick" is no
+# longer a guess: gripper_tcp_joint's own origin is `rpy="0 0 0"` off
+# gripper_mount_link (a pure translation, kr10_r900_2_description's own
+# xacro), and both gripper_finger_*_joint origins are ALSO identity off the
+# same link -- so the finger mesh's own local Y axis, exactly as authored
+# in the STL, IS gripper_tcp's local Y with zero rotation in between, the
+# same axis grasp.py's own docstring already confirms (from real
+# tuned-pose FK data, not a guess) is the physical stick's base->tip
+# direction. Half the finger mesh's own narrowest bbox dimension (its Y
+# extent) is therefore, PROVABLY, the same physical quantity at both call
+# sites below -- not two independent measurements that happen to be close:
+#   - grasp_offset_for_length's use of JAW_CONTACT_HALF_LENGTH_M: how far
+#     the jaw's own contact face extends to either side of the grasp
+#     point, along the stick's axis (never grip closer to a short stick's
+#     own tip than this).
+#   - jaw_clearance.check_jaw_clearance's use of JAW_RADIUS_M: the swept
+#     capsule's radius for a coarse "does the jaw assembly clip a
+#     neighbouring placed stick" check -- an axial extent standing in for
+#     a true perpendicular radius, an already-known shortcut this
+#     re-derivation does not change, only re-measures.
+# Defined as one literal with the other set equal to it, rather than as two
+# independently-guessed numbers (the OLD 7.7mm/8.0mm split) that can
+# silently drift apart on the next mesh swap.
+#
+# New mesh bbox, measured directly from the STL vertices, 2026-09-05:
+# 18.65 x 11.0 x 31.3mm (was 23.65 x 15.39 x 36.8mm) -- narrowest/Y-axis
+# dimension 11.0mm, half = 5.5mm.
+JAW_RADIUS_M = 0.0055
+JAW_CONTACT_HALF_LENGTH_M = JAW_RADIUS_M
+
+# MIN_GRASP_OFFSET_M has no equally rigorous derivation -- this re-derivation
+# does not change its "rough estimate, not measured" status (same as the
+# original 10mm value). Kept PROPORTIONAL to the jaw geometry above rather
+# than picked independently: the old value (10mm) was ~1.299x the old
+# JAW_RADIUS_M (7.7mm); applying that same ratio to the new JAW_RADIUS_M
+# preserves whatever safety margin the original author intended relative to
+# jaw size, rather than an arbitrary fresh guess. Re-measure against real
+# hardware before trusting this for a short-stick (Phase 5) grasp.
+MIN_GRASP_OFFSET_M = 0.00714
 
 # The KUKA feeder's grasp point is FIXED in the fixture's own frame --
 # KUKA_IMPLEMENTATION_PLAN.md Sec 0 point 2: "the gripper always grasps at
 # the same fixed vertical-hole location regardless of stick length." Unlike
 # SO-100 (where the grip point is chosen per-stick, up from whichever
 # stick's own base), grasp_offset_for_length() is therefore NOT needed for
-# Phase 1's feeder grasp -- GRASP_OFFSET_M (21.07mm as of 2026-09-02) plus
-# JAW_CONTACT_HALF_LENGTH_M (8mm) = 29.07mm sits safely inside even the
-# shortest allowed stick (35mm, STICK_LENGTH_RANGE_M below) with margin to
-# spare. The function is still provided (mirroring so_arm_100_kinematics'
+# Phase 1's feeder grasp -- GRASP_OFFSET_M (21.09mm as of 2026-09-09) plus
+# JAW_CONTACT_HALF_LENGTH_M (5.5mm as of 2026-09-05) = 26.59mm sits safely
+# inside even the shortest allowed stick (35mm, STICK_LENGTH_RANGE_M below)
+# with margin to spare. The function is still provided (mirroring so_arm_100_kinematics'
 # public API) for Phase 5's general stick-placement grasp, where a stick may
 # need to be re-gripped somewhere other than the fixed feeder location.
 
@@ -124,9 +182,8 @@ JOINT_ALLOWANCE_M = 0.001  # 1mm/end, given directly by the user (KQ3) -- NOT
 # interference (KUKA_IMPLEMENTATION_PLAN.md Sec 3 Phase 2).
 
 # --- Jaw clearance -----------------------------------------------------------
-# Half the finger mesh's own narrowest bbox dimension (15.39mm), the same
-# "rough estimate, not measured" status as JAW_CONTACT_HALF_LENGTH_M above.
-JAW_RADIUS_M = 0.0077
+# JAW_RADIUS_M is defined earlier alongside JAW_CONTACT_HALF_LENGTH_M --
+# see that section's own comment for why they share one derivation.
 
 # Already-placed sticks are checked as capsules too: the round stock's own
 # radius (half of STICK_SECTION_M) plus a small inflation, matching

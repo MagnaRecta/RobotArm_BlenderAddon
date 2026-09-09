@@ -92,7 +92,10 @@ def hard_min_stick_length_m(robot_id=core_robots.SO_ARM_100_ID):
     -- Phase 0 confirms the real numbers with a ruler. Read from the
     SELECTED robot's own module, not so_arm_100's unconditionally -- each
     robot's own floor genuinely differs (so_arm_100: 35mm; kr10_r900_2:
-    18mm, round 2mm stock -- see that package's own constants.py).
+    12.64mm as of the 2026-09-09 re-vendor, round 2mm stock -- see that
+    package's own constants.py; it was 18mm before that package's gripper
+    finger meshes were swapped for shorter ones, so treat any figure quoted
+    here as illustrative and the constants as the source of truth).
     """
     kinematics = core_robots.get_robot(robot_id).kinematics
     return kinematics.MIN_GRASP_OFFSET_M + kinematics.JAW_CONTACT_HALF_LENGTH_M

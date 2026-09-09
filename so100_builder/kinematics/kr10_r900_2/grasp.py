@@ -169,6 +169,69 @@ def orientation_from_stick_axis(stick_axis_hat, roll_rad=0.0, reference_up=(0.0,
     )
 
 
+def orientation_pointing_down(roll_rad=0.0, direction_hat=(0.0, 0.0, -1.0)):
+    """Added 2026-09-04 for the manual jog tool (operator_gui.py's "move to
+    a coordinate" option): a full ``gripper_tcp`` target rotation matrix
+    whose local **Z** column (the tool's own approach/pointing axis --
+    ``motion.py``'s own ``retreat`` handling calls this "the gripper's own
+    approach axis, local -Z") equals ``direction_hat``, default straight
+    down (world ``-Z``). Deliberately Z here, NOT :func:`orientation_from_stick_axis`'s
+    Y -- that function aligns the axis a physically HELD STICK runs along
+    (this gripper's local Y, derived from real tuned-pose data -- see this
+    module's own docstring), a different, perpendicular axis from the
+    direction the tool itself points/travels along to get there. Confusing
+    the two would build a gripper that holds a stick pointing straight
+    down, not one that itself points down.
+
+    Built by reusing :func:`orientation_from_stick_axis`'s exact
+    Gram-Schmidt/roll construction (aligning ITS Y column to
+    ``direction_hat`` instead) and then cyclically permuting the resulting
+    right-handed columns ``(X, Y, Z) -> (Z, X, Y)`` so ``direction_hat``
+    lands in the Z slot -- a cyclic permutation of a right-handed frame's
+    own columns is still right-handed (verified: 2000 random rolls, exact
+    orthonormality and ``x cross y == z`` to float precision; round-tripped
+    through ``chain.ik()`` + ``chain.fk()`` at a real reachable point,
+    position and Z-axis-direction error both at floating-point noise).
+    This is a relabelling of the SAME deterministic frame, not a second,
+    independently-written derivation that could disagree with the first.
+    """
+    m = orientation_from_stick_axis(direction_hat, roll_rad)
+    x0 = (m[0][0], m[1][0], m[2][0])
+    y0 = (m[0][1], m[1][1], m[2][1])  # == normalize(direction_hat)
+    z0 = (m[0][2], m[1][2], m[2][2])
+    return (
+        (z0[0], x0[0], y0[0]),
+        (z0[1], x0[1], y0[1]),
+        (z0[2], x0[2], y0[2]),
+    )
+
+
+def iter_vertical_poses(position_m, roll_rad=0.0, direction_hat=(0.0, 0.0, -1.0)):
+    """Every (``elbow_up``, ``wrist_flip``) branch that puts ``gripper_tcp``
+    at ``position_m`` with its local Z axis pointing along ``direction_hat``
+    (world ``-Z``, straight down, by default) -- the general "point the
+    tool in a fixed world direction" analogue of :func:`iter_stick_placements`,
+    for the manual jog tool rather than stick placement (see
+    :func:`orientation_pointing_down`'s own docstring for how the two
+    differ). Same reason for a generator rather than a single winner as
+    :func:`iter_stick_placements`: ``chain.ik()`` has no notion of the
+    robot's own links colliding with EACH OTHER, so a caller doing
+    joint-space planning needs every reachable branch to retry when
+    MoveIt's own collision-aware planner rejects one.
+
+    Never raises. Yields ``(joints, elbow_up, wrist_flip)``; an empty
+    iteration means unreachable at this exact position/roll.
+    """
+    target_rot = orientation_pointing_down(roll_rad, direction_hat)
+    for elbow_up in (True, False):
+        for wrist_flip in (False, True):
+            try:
+                joints = ik(position_m, target_rot, elbow_up=elbow_up, wrist_flip=wrist_flip)
+            except Unreachable:
+                continue
+            yield joints, elbow_up, wrist_flip
+
+
 def solve_stick_placement(base_xyz_m, tip_xyz_m, grasp_offset_m=GRASP_OFFSET_M,
                           roll_rad=0.0, elbow_up=True, wrist_flip=False):
     """The full solve for a single, specific branch/roll choice: given a

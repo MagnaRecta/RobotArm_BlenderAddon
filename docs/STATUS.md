@@ -117,18 +117,22 @@ Phase 6 (rotating table) have not been started. See
 
 Format: `[owning side]` short description — pointer.
 
-- `[shared]` **`kr10_r900_2_kinematics` has DRIFTED again (noticed
-  2026-09-09), fourth time.** `test_vendor_sync.py` is failing on three
-  modules: `constants.py` (~71 changed lines, upstream 2026-09-08),
-  `grasp.py` (~65 added lines, upstream 2026-09-07) and `__init__.py` (2 new
-  exports). `chain.py` and `jaw_clearance.py` are still byte-identical.
-  Noticed while running the suite for an unrelated change — **not** caused by
-  it, and deliberately left alone: re-vendoring is a decision about which
-  upstream state to freeze, and the diff includes new public functions, not
-  just comments. Re-vendor from
-  `~/ros2_ws/src/kuka_control/kr10_r900_2_kinematics/kr10_r900_2_kinematics/`
-  when the upstream side is ready, reading the diff first as with the three
-  previous cycles below.
+- `[Blender]` **The addon's `jaw_width_mm` default silently overrides the
+  vendored jaw geometry (noticed 2026-09-09).** `ops/order.py`'s
+  `build_solver()` always passes `jaw_width_m=props.jaw_width_mm / 1000.0`,
+  and that property defaults to **20 mm** — so_arm_100's own
+  `JAW_RADIUS_M * 2`. `core/order.py` would otherwise read the selected
+  robot's own value, which for kr10_r900_2 is now a *measured* 11 mm (from
+  the finger STL, see its `constants.py`). The property is not exposed in any
+  panel, so there is no way to notice or correct this from the UI, and its
+  own description still says "ESTIMATE — Phase 0 measures the real envelope"
+  even though that measurement now exists for the KR10. Currently harmless on
+  the one design tested (a dense lattice warns on 264/280 sticks at *both*
+  widths — the sticks are genuinely crowded, not the jaw model being
+  over-wide), so left alone rather than changed speculatively. The right fix
+  is probably to default the property per robot, the same problem
+  `build_plate_height_mm` and the Reset Stock button already solve two
+  different ways.
 
 - `[shared]` **Multi-robot support kicked off 2026-08-21.** The addon and the
   build-file protocol are being generalized to target more than one arm: the
@@ -224,6 +228,54 @@ Format: `[owning side]` short description — pointer.
   tradeoff); see `ROS2_IMPLEMENTATION_PLAN.md` §11 Phase 5's note.
 
 ## Resolved
+
+- `[shared]` **`kr10_r900_2_kinematics` re-vendored a fourth time,
+  2026-09-09** (user: "please update the kinematics to be up to date").
+  Resolved the drift `test_vendor_sync.py` had been reporting. All six
+  modules plus `VERSION` re-copied byte-verbatim; `chain.py`,
+  `envelope.py` and `jaw_clearance.py` were already identical, so the real
+  changes were in three files. **This one carries real hardware findings,
+  not just comments:**
+  - `GRIPPER_TCP_Z_M` **0.0805 → 0.0775** — the gripper's finger STLs were
+    swapped for shorter ones (2026-09-04), and the held stick then rendered
+    visibly lower than the new fingers reach. Cut 2 mm then a further 1 mm
+    the same day, both on the user's own visual judgement in RViz, against a
+    5.5 mm ceiling a full tip-relative rederivation would suggest — so
+    **expect this to move again**.
+  - `GRASP_OFFSET_M` **0.021072 → 0.021087** — recalibrated twice to stay
+    consistent with the TCP change, from the live `lower` pose.
+  - `JAW_RADIUS_M` **0.0077 → 0.0055** and `JAW_CONTACT_HALF_LENGTH_M`
+    **0.008 → 0.0055** — re-derived 2026-09-05 from the new finger mesh's
+    own bbox (18.65 × 11.0 × 31.3 mm, was 23.65 × 15.39 × 36.8 mm). Upstream
+    now defines the two as one literal rather than two independent guesses,
+    having established from the xacro that they are provably the same
+    physical quantity.
+  - `MIN_GRASP_OFFSET_M` **0.010 → 0.00714** — kept proportional to the new
+    jaw radius; still explicitly "rough estimate, not measured".
+  - `grasp.py` / `__init__.py`: purely additive —
+    `orientation_pointing_down()` and `iter_vertical_poses()` for a manual
+    jog tool. No behaviour change for the addon.
+
+  **Addon-side consequences, all checked:** `hard_min_stick_length_m
+  ("kr10_r900_2")` drops **18.0 mm → 12.64 mm** (it is
+  `MIN_GRASP_OFFSET_M + JAW_CONTACT_HALF_LENGTH_M`), which also lowers
+  `safe_min_stick_length_bound_m()` and hence the Min Stick Length widget's
+  floor. Two addon tests failed and were fixed rather than suppressed:
+  `test_sticks.py`'s hardcoded 18.0 canary (updated, and commented to say it
+  is a deliberate duplicate to be updated rather than deleted), and
+  `test_kinematics_kr10_vendored.py`, which turned out to be **two** upstream
+  revisions behind — it still had the pre-2026-08-25 sim-tuned poses. Both
+  `TUNED_POSES_DEG` and `EXPECTED_TCP_POSITION_M` were re-ported from
+  upstream's own `test/test_chain.py`, and its new `TestTranslateHoldingWrist`
+  class ported across too (`translate_holding_wrist` was already in the
+  vendored `chain.py` but had no addon-side coverage). 474/474 pass in both
+  bare CPython and real Blender, up from 469.
+
+  **No visible change on the reporter's own 280-stick lattice**: still
+  280 buildable / 0 impossible, identical build order, identical warning
+  counts. The constant changes are small enough to land inside the same
+  verdicts on that design — which is evidence they are consistent, not
+  evidence they do not matter.
 
 - `[Blender]` **Build order now has real layers, so "far side first" finally
   runs, 2026-09-09** — user report: "when trying to generate a build order, I

@@ -483,7 +483,14 @@ class TestMultiRobotGeometry(unittest.TestCase):
         self.assertAlmostEqual(mm(so_arm_100_floor), 35.0, places=6)
         self.assertAlmostEqual(
             kr10_floor, krc.MIN_GRASP_OFFSET_M + krc.JAW_CONTACT_HALF_LENGTH_M, places=12)
-        self.assertAlmostEqual(mm(kr10_floor), 18.0, places=6)
+        # Deliberately duplicates what the line above already derives: a
+        # canary that fires when a re-vendor moves the vendored constants,
+        # so the change is noticed and reasoned about rather than absorbed
+        # silently. It has fired once already -- 18.0mm until the 2026-09-09
+        # re-vendor, when kr10_r900_2's gripper fingers were swapped for
+        # shorter meshes (JAW_CONTACT_HALF_LENGTH_M 8.0 -> 5.5mm,
+        # MIN_GRASP_OFFSET_M 10.0 -> 7.14mm). Update it, do not delete it.
+        self.assertAlmostEqual(mm(kr10_floor), 12.64, places=6)
         self.assertLess(kr10_floor, so_arm_100_floor)
 
     def test_safe_bound_is_the_lowest_of_every_registered_robot(self):
@@ -495,8 +502,9 @@ class TestMultiRobotGeometry(unittest.TestCase):
             places=12)
 
     def test_a_stick_between_the_two_robots_floors_is_refused_for_so_arm_100(self):
-        # 25mm clears kr10_r900_2's own floor (18mm) but not so_arm_100's
-        # (35mm) -- the check must use the robot it is actually asked about.
+        # 25mm clears kr10_r900_2's own floor (12.64mm) but not
+        # so_arm_100's (35mm) -- the check must use the robot it is actually
+        # asked about.
         with self.assertRaises(ValueError):
             S.extract_sticks(STACK_POINTS, STACK_EDGES, robot_id="so_arm_100",
                              min_stick_length_m=0.025)
