@@ -17,6 +17,7 @@ from bpy.props import (
 )
 from bpy.types import PropertyGroup
 
+from .core import order as core_order
 from .core import robots as core_robots
 from .core import sticks as core_sticks
 from .core import state as core_state
@@ -264,6 +265,20 @@ class SO100SceneProps(PropertyGroup):
         name="Ground Tolerance", default=core_sticks.DEFAULT_GROUND_EPSILON_M * 1000.0,
         min=0.0, max=10.0, precision=3,
         description="A vertex within this distance of the build plate seats on it",
+    )
+    layer_tolerance_mm: FloatProperty(
+        name="Layer Height Tolerance",
+        default=core_order.DEFAULT_LAYER_TOLERANCE_M * 1000.0,
+        min=0.001, max=500.0, precision=2,
+        description="Sticks whose tops are within this of each other form one "
+                    "layer of the build order, and the robot finishes a layer "
+                    "before starting the next. Within a layer it works from "
+                    "the far side toward itself, so it never builds a wall "
+                    "between its own shoulder and the sticks it still has to "
+                    "place. Set this below the height of one course of the "
+                    "design and above the sub-millimetre spread that mesh "
+                    "expansion leaves behind -- the default suits any design "
+                    "whose courses are more than a centimetre apart",
     )
     build_plate_height_mm: FloatProperty(
         name="Build Plate Height", default=0.0,

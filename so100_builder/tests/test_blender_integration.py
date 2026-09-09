@@ -144,15 +144,43 @@ class TestExtraction(BlenderTestCase):
         self.props.base_empty = None
         self.assertFalse(bpy.ops.so100.extract_sticks.poll())
 
-    def test_edit_mode_is_refused_rather_than_silently_wrong(self):
+    def test_extracting_from_edit_mode_switches_out_and_back_by_itself(self):
+        """2026-09-09 user request: "I would like the script to automatically
+        change modes when needed" -- this used to be refused outright."""
         bpy.context.view_layer.objects.active = self.design
         bpy.ops.object.mode_set(mode="EDIT")
         try:
-            with self.assertRaises(RuntimeError) as caught:
-                bpy.ops.so100.extract_sticks()
-            self.assertIn("Edit Mode", str(caught.exception))
+            self.assertEqual(bpy.ops.so100.extract_sticks(), {"FINISHED"})
+            self.assertEqual(len(self.props.sticks), 12)
+            # Put back exactly where the user was, not left in Object Mode.
+            self.assertEqual(self.design.mode, "EDIT")
         finally:
-            bpy.ops.object.mode_set(mode="OBJECT")
+            if self.design.mode != "OBJECT":
+                bpy.ops.object.mode_set(mode="OBJECT")
+
+    def test_extracting_from_edit_mode_uses_the_edited_coordinates(self):
+        """Leaving Edit Mode is what makes the read correct, not just legal:
+        Blender flushes the BMesh into the Mesh on the way out, so the sticks
+        come from the design as it is on screen. Reading it in place would
+        have quietly used the stale pre-edit vertex positions."""
+        self.extract()
+        before = self.props.sticks[0].stick_length_mm
+
+        bpy.context.view_layer.objects.active = self.design
+        bpy.ops.object.mode_set(mode="EDIT")
+        try:
+            bm = bmesh.from_edit_mesh(self.design.data)
+            bm.verts.ensure_lookup_table()
+            for vert in bm.verts:
+                vert.co.z *= 2.0
+            bmesh.update_edit_mesh(self.design.data)
+            self.assertEqual(bpy.ops.so100.extract_sticks(), {"FINISHED"})
+        finally:
+            if self.design.mode != "OBJECT":
+                bpy.ops.object.mode_set(mode="OBJECT")
+
+        uprights = [item.stick_length_mm for item in self.props.sticks]
+        self.assertGreater(max(uprights), before * 1.5)
 
     def test_a_mesh_with_faces_still_extracts_and_warns(self):
         mesh = self.design.data
@@ -662,6 +690,74 @@ class TestBuildOrderOperator(BlenderTestCase):
         first = [(i.stick_id, i.order) for i in self._order().sticks]
         second = [(i.stick_id, i.order) for i in self._order().sticks]
         self.assertEqual(first, second)
+
+    # --- Edit Mode (2026-09-09 user report) ---------------------------------
+    # "When trying to change the order of one edge, I get the error 'Cannot
+    # add vertices in edit mode'." Check By Eye leaves the BUILD MESH in Edit
+    # Mode, and Move Earlier/Later is the button reached for next -- so every
+    # operator that regenerates the build mesh has to cope with that itself.
+
+    def _check_by_eye(self, index=0):
+        self.props.active_stick_index = index
+        self.assertEqual(bpy.ops.so100.select_stick_in_viewport(), {"FINISHED"})
+        self.assertEqual(self.props.build_mesh.mode, "EDIT")
+
+    def _selected_edges(self):
+        bm = bmesh.from_edit_mesh(self.props.build_mesh.data)
+        return sorted(edge.index for edge in bm.edges if edge.select)
+
+    def test_moving_a_step_works_straight_after_check_by_eye(self):
+        self._use_a_three_stick_chain()
+        props = self._order()
+        index = next(i for i, item in enumerate(props.sticks) if item.order == 1)
+        self._check_by_eye(index)
+        try:
+            self.assertEqual(
+                bpy.ops.so100.move_build_step(direction=-1), {"FINISHED"})
+            self.assertEqual(props.sticks[index].order, 0)
+        finally:
+            if props.build_mesh.mode != "OBJECT":
+                bpy.ops.object.mode_set(mode="OBJECT")
+
+    def test_moving_a_step_keeps_the_check_by_eye_highlight(self):
+        """The build mesh is regenerated, so the selection has to be put back
+        by hand or the user is left staring at an unhighlighted mesh."""
+        self._use_a_three_stick_chain()
+        props = self._order()
+        index = next(i for i, item in enumerate(props.sticks) if item.order == 1)
+        self._check_by_eye(index)
+        try:
+            self.assertEqual(self._selected_edges(), [index])
+            bpy.ops.so100.move_build_step(direction=-1)
+            self.assertEqual(props.build_mesh.mode, "EDIT")
+            self.assertEqual(self._selected_edges(), [index])
+        finally:
+            if props.build_mesh.mode != "OBJECT":
+                bpy.ops.object.mode_set(mode="OBJECT")
+
+    def test_recomputing_the_order_works_straight_after_check_by_eye(self):
+        self._order()
+        self._check_by_eye(0)
+        try:
+            self.assertEqual(bpy.ops.so100.compute_build_order(), {"FINISHED"})
+            self.assertEqual(self.props.build_mesh.mode, "EDIT")
+        finally:
+            if self.props.build_mesh.mode != "OBJECT":
+                bpy.ops.object.mode_set(mode="OBJECT")
+
+    def test_exporting_works_straight_after_check_by_eye(self):
+        import tempfile
+
+        self._order()
+        self._check_by_eye(0)
+        path = os.path.join(tempfile.mkdtemp(), "from_edit_mode.build.json")
+        try:
+            self.assertEqual(
+                bpy.ops.so100.export_build_file(filepath=path), {"FINISHED"})
+            self.assertTrue(os.path.exists(path))
+        finally:
+            if self.props.build_mesh.mode != "OBJECT":
+                bpy.ops.object.mode_set(mode="OBJECT")
 
 
 @unittest.skipIf(bpy is None, "requires Blender")

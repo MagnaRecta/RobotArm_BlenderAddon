@@ -142,6 +142,7 @@ class SO100_PT_design(SO100PanelBase, Panel):
             column.prop(props, "merge_tolerance_mm")
             column.prop(props, "residual_tolerance_mm")
             column.prop(props, "ground_epsilon_mm")
+            column.prop(props, "layer_tolerance_mm")
 
         row = layout.row(align=True)
         row.scale_y = 1.4

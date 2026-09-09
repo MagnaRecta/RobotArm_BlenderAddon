@@ -25,7 +25,13 @@ from ..core import robots as core_robots
 from ..core import state as core_state
 from ..core import transform as core_transform
 from ..io import build_file as build_io
-from .design import check_design_ready, ordered_ids, rebuild_build_mesh, store_results
+from .design import (
+    check_design_ready,
+    object_mode_for_mesh_writes,
+    ordered_ids,
+    rebuild_build_mesh,
+    store_results,
+)
 from .order import build_solver  # the same pipeline, so export cannot drift
 
 
@@ -106,7 +112,12 @@ class SO100_OT_export_build_file(Operator, ExportHelper):
 
     def execute(self, context):
         props = context.scene.so100
+        # Re-extracts and regenerates the build mesh, so it needs the same
+        # Edit Mode guard as every other data-touching operator (2026-09-09).
+        with object_mode_for_mesh_writes(context, props):
+            return self._execute(context, props)
 
+    def _execute(self, context, props):
         problem = check_design_ready(props)
         if problem:
             return _report_error(self, problem)

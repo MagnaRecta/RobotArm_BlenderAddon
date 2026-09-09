@@ -31,6 +31,8 @@ Click **Extract Sticks**. This grows the design so fixed-length sticks fit with 
 
 In the **Plan** panel, click **Compute Build Order**. This validates every placement against the robot's real kinematics and reports errors/warnings.
 
+The robot builds one layer at a time, and works each layer from the far side back toward itself so it never walls off a stick it still has to reach. If your design's courses are closer together than a centimetre, lower **Layer Height Tolerance** (Design ▸ Advanced) to match.
+
 - In **Sticks**, once a stick has a build position, use **Move Earlier / Move Later** to manually reorder it.
 
 ## 5. Inspect sticks

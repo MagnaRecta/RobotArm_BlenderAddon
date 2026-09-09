@@ -28,6 +28,7 @@ from .design import (
     check_design_ready,
     effective_ground_height_m,
     extract_with_autoflip,
+    object_mode_for_mesh_writes,
     ordered_ids,
     rebuild_build_mesh,
     store_results,
@@ -59,6 +60,7 @@ def build_solver(context, props):
         ground_height_m=effective_ground_height_m(profile, props),
         ground_required=props.require_build_plate,
         backtrack_limit=props.backtrack_limit,
+        layer_tolerance_m=props.layer_tolerance_mm / 1000.0,
         robot_id=props.robot_id,
         jaw_width_m=props.jaw_width_mm / 1000.0,
         section_m=props.section_mm / 1000.0,
@@ -83,27 +85,35 @@ class SO100_OT_compute_build_order(Operator):
 
     # --- shared ---------------------------------------------------------------
 
+    # Both halves take the Edit Mode guard separately rather than one block
+    # spanning the pair: the solve between them runs across timer ticks and
+    # touches no mesh data at all, so there is nothing to protect there, and
+    # holding a mode switch open across ticks would have to survive an Esc
+    # cancel to put the user back.
+
     def _prepare(self, context):
         props = context.scene.so100
-        problem = check_design_ready(props)
-        if problem:
-            return problem
-        try:
-            self._solver, self._extraction = build_solver(context, props)
-        except (ValueError, core_transform.SingularMatrix) as exc:
-            return str(exc)
+        with object_mode_for_mesh_writes(context, props):
+            problem = check_design_ready(props)
+            if problem:
+                return problem
+            try:
+                self._solver, self._extraction = build_solver(context, props)
+            except (ValueError, core_transform.SingularMatrix) as exc:
+                return str(exc)
         return None
 
     def _finish(self, context):
         props = context.scene.so100
         result, verdicts, auto_flipped = self._extraction
         order_result = self._solver.result
-        store_results(props, result, verdicts, auto_flipped, order_result)
-        # This operator re-extracts, so it owns the build mesh too -- both so
-        # it works standalone (without pressing Extract Sticks first) and so
-        # the "edge i is sticks[i]" invariant Check By Eye relies on cannot
-        # be left pointing at a stale mesh.
-        rebuild_build_mesh(context, props, result)
+        with object_mode_for_mesh_writes(context, props):
+            store_results(props, result, verdicts, auto_flipped, order_result)
+            # This operator re-extracts, so it owns the build mesh too -- both
+            # so it works standalone (without pressing Extract Sticks first)
+            # and so the "edge i is sticks[i]" invariant Check By Eye relies
+            # on cannot be left pointing at a stale mesh.
+            rebuild_build_mesh(context, props, result)
 
         level = {"INFO"}
         if order_result.errors:
@@ -227,6 +237,13 @@ class SO100_OT_move_build_step(Operator):
 
     def execute(self, context):
         props = context.scene.so100
+        # Check By Eye leaves the build mesh in Edit Mode, and this is the
+        # button the user reaches for next -- so this is the exact path the
+        # 2026-09-09 "Cannot add vertices in edit mode" report came from.
+        with object_mode_for_mesh_writes(context, props):
+            return self._execute(context, props)
+
+    def _execute(self, context, props):
         current = props.sticks[props.active_stick_index]
         target_order = current.order + self.direction
         if not (0 <= target_order < len(props.sticks)):

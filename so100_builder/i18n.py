@@ -227,6 +227,23 @@ _JA = {
     (_D, "Ground Tolerance"): "接地許容値",
     (_D, "A vertex within this distance of the build plate seats on it"):
         "ビルドプレートからこの距離以内にある頂点は接地しているとみなされます",
+    (_D, "Layer Height Tolerance"): "レイヤー高さ許容値",
+    (_D, "Sticks whose tops are within this of each other form one "
+        "layer of the build order, and the robot finishes a layer "
+        "before starting the next. Within a layer it works from "
+        "the far side toward itself, so it never builds a wall "
+        "between its own shoulder and the sticks it still has to "
+        "place. Set this below the height of one course of the "
+        "design and above the sub-millimetre spread that mesh "
+        "expansion leaves behind -- the default suits any design "
+        "whose courses are more than a centimetre apart"):
+        "上端どうしがこの範囲内にあるスティックは組み立て順序上の同一レイヤーと"
+        "みなされ、ロボットは次のレイヤーに進む前に現在のレイヤーを完成させます。"
+        "レイヤー内では遠い側から手前側へ向かって作業するため、まだ設置すべき"
+        "スティックと自身の肩との間に壁を作ってしまうことがありません。デザイン"
+        "1段分の高さより小さく、かつメッシュ展開が残すサブミリメートル単位の"
+        "ばらつきより大きい値を設定してください -- 既定値は、各段が1センチ"
+        "メートル以上離れているデザインであれば適合します",
     (_D, "Build Plate Height"): "ビルドプレート高さ",
     (_D, "How far the physical build plate is raised ABOVE the "
         "selected robot's own confirmed build-volume floor -- "

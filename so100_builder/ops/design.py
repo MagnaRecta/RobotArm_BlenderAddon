@@ -6,6 +6,8 @@ thread inside an operator's ``execute()``; nothing here ever touches ``bpy``
 from a background thread (constraint B2).
 """
 
+import contextlib
+
 import bmesh
 import bpy
 from bpy.props import BoolProperty, IntProperty, StringProperty
@@ -95,6 +97,103 @@ def effective_ground_height_m(profile, props):
 def _report_error(operator, message):
     operator.report({"ERROR"}, message)
     return {"CANCELLED"}
+
+
+# --- Edit Mode (2026-09-09 user report) --------------------------------------
+
+
+def select_only_edge(obj, index):
+    """Select exactly one edge on ``obj``, which must already be in Edit Mode.
+
+    Goes through ``bmesh`` rather than ``bpy.ops.mesh.select_all`` so it is
+    callable from anywhere -- including the mode-restore path below, which
+    runs in a ``finally`` and has no guaranteed operator context to lend the
+    poll of a ``mesh.*`` operator.
+    """
+    bm = bmesh.from_edit_mesh(obj.data)
+    bm.edges.ensure_lookup_table()
+    for vertex in bm.verts:
+        vertex.select = False
+    for edge in bm.edges:
+        edge.select = False
+    if 0 <= index < len(bm.edges):
+        bm.edges[index].select = True
+    # Makes the selection consistent with whatever select mode the user is
+    # in (vertex/edge/face), which is what actually draws it highlighted.
+    bm.select_flush_mode()
+    bmesh.update_edit_mesh(obj.data)
+
+
+@contextlib.contextmanager
+def object_mode_for_mesh_writes(context, props):
+    """Drop out of Edit Mode for the duration of a block that reads or writes
+    mesh data, then put the user back exactly where they were.
+
+    Blender keeps an edit-mode mesh in a BMesh and will not let the
+    underlying ``Mesh`` be touched until that mode is left:
+    ``mesh.from_pydata()`` raises "Cannot add vertices in edit mode", and an
+    attribute layer's ``.data`` reads back **empty**, which is the quieter
+    and nastier of the two -- ``assign_stable_ids`` would see a zero-length
+    id layer and mint fresh ids for every edge.
+
+    Check By Eye deliberately leaves the BUILD MESH in Edit Mode, so every
+    operator that re-extracts or regenerates the build mesh landed on that
+    error until the user manually toggled modes -- reported 2026-09-09,
+    hitting Move Earlier/Later straight after checking a stick by eye ("it is
+    a hassle having to change modes. I would like the script to automatically
+    change modes when needed").
+
+    Leaving Edit Mode is also what makes the read CORRECT rather than merely
+    legal: Blender flushes the BMesh back into the Mesh on the way out, so a
+    design the user was mid-edit on gets extracted at the coordinates now on
+    screen instead of the stale pre-edit ones. That is the same reasoning
+    ``check_design_ready`` used to refuse the whole operation over; it now
+    stays only as a guard for direct API callers, since every button-driven
+    path comes through here first.
+
+    Coming back, the build mesh's edge selection has to be re-applied by
+    hand: ``rebuild_build_mesh`` replaces the mesh data outright, so the
+    Check By Eye highlight would otherwise return empty. The camera is
+    deliberately NOT re-framed -- whatever angle the user was inspecting
+    from survives a reorder.
+
+    ⚠ Blender's multi-object Edit Mode is restored only for the ACTIVE
+    object: leaving drops every object that was in Edit Mode, and coming back
+    brings back the active one. Same as pressing Tab twice by hand.
+    """
+    view_layer = context.view_layer
+    obj = view_layer.objects.active if view_layer is not None else None
+    previous = obj.mode if obj is not None else "OBJECT"
+    was_build_mesh = obj is not None and obj == props.build_mesh
+    index = props.active_stick_index
+
+    if previous != "OBJECT":
+        bpy.ops.object.mode_set(mode="OBJECT")
+    try:
+        yield previous
+    finally:
+        if previous != "OBJECT":
+            _restore_mode(context, props, obj, previous, was_build_mesh, index)
+
+
+def _restore_mode(context, props, obj, mode, was_build_mesh, index):
+    try:
+        # Clear Results deletes the build mesh outright, and any operator can
+        # leave the object hidden or out of the view layer -- in none of those
+        # cases is there a mode to go back to, and forcing one would raise.
+        if obj.name not in context.view_layer.objects:
+            return
+    except ReferenceError:
+        return  # the object itself was removed while the block ran
+
+    context.view_layer.objects.active = obj
+    try:
+        bpy.ops.object.mode_set(mode=mode)
+    except RuntimeError:
+        return  # hidden, or a mode this object cannot be in any more
+
+    if was_build_mesh and mode == "EDIT" and obj.type == "MESH":
+        select_only_edge(obj, index)
 
 
 # --- stable ids (Sec 9.2) ----------------------------------------------------
@@ -485,12 +584,19 @@ class SO100_OT_drop_to_build_plate(Operator):
         return (
             props.design_mesh is not None
             and props.base_empty is not None
-            and props.design_mesh.mode == "OBJECT"
             and len(props.design_mesh.data.vertices) > 0
         )
 
     def execute(self, context):
         props = context.scene.so100
+        # Edit Mode would report the pre-edit vertex coordinates, so the drop
+        # would be computed against a mesh that is no longer on screen. Same
+        # auto-switch as every other data-touching operator here (2026-09-09)
+        # -- this used to be a poll() that just greyed the button out.
+        with object_mode_for_mesh_writes(context, props):
+            return self._execute(context, props)
+
+    def _execute(self, context, props):
         obj = props.design_mesh
         base_matrix = core_transform.to_tuple_4x4(props.base_empty.matrix_world)
         scale_length = context.scene.unit_settings.scale_length
@@ -621,7 +727,10 @@ class SO100_OT_extract_sticks(Operator):
 
     def execute(self, context):
         props = context.scene.so100
+        with object_mode_for_mesh_writes(context, props):
+            return self._execute(context, props)
 
+    def _execute(self, context, props):
         problem = check_design_ready(props)
         if problem:
             return _report_error(self, problem)
@@ -723,12 +832,7 @@ class SO100_OT_select_stick_in_viewport(Operator):
         context.view_layer.objects.active = obj
 
         bpy.ops.object.mode_set(mode="EDIT")
-        bpy.ops.mesh.select_all(action="DESELECT")
-
-        bm = bmesh.from_edit_mesh(obj.data)
-        bm.edges.ensure_lookup_table()
-        bm.edges[index].select = True
-        bmesh.update_edit_mesh(obj.data)
+        select_only_edge(obj, index)
 
         area = next((a for a in context.screen.areas if a.type == "VIEW_3D"), None)
         if area is not None:

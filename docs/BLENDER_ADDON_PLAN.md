@@ -847,7 +847,7 @@ while sticks remain:
     else:
         backtrack()                           # undo the last choice, try the next best
 
-cost(s) = ( max_z(s),                         # primary: build upward
+cost(s) = ( layer_of(s),                      # primary: build upward
             -distance_from_robot(s),          # secondary: far side first
             -support_count(s) )               # tertiary: prefer better-anchored
 ```
@@ -858,6 +858,66 @@ Notes:
 - Backtracking keeps it correct without an exponential search in practice —
   cap the backtrack depth and report honestly if the cap is hit.
 - Run it in chunks across timer ticks for big meshes (B3).
+
+### 6.1.1 ✅ What "a layer" actually is (fixed 2026-09-09)
+
+`cost`'s primary key above says `layer_of(s)`. Until 2026-09-09 it said
+`max_z(s)` — the stick's own top as a raw float — and **that quietly disabled
+the entire C2 accessibility rule**.
+
+The mesh-expansion solve (§5.2) nudges every vertex by a fraction of a
+millimetre to make fixed-length sticks fit. So a course of sticks that is
+physically flat reaches the solver as dozens of distinct Z values: on the
+2026-09-09 voxel-lattice test design, one physically flat course arrived
+spread across ten distinct heights spanning 1.1 mm, while the real gap
+between courses was 34 mm. Raw `max_z` therefore **never tied**, the
+secondary "far side first" key never ran, and the within-layer order was
+decided entirely by sub-millimetre expansion noise.
+
+The visible symptom, and how it was reported: *"when trying to generate a
+build order, I feel like the algorithm prioritizes the outer layer. This is a
+problem since the robot will not be able to reach the inner sticks if the
+outer layer is already built."* Exactly so — the whole outer ring of each
+course, near side included, went up before that course's core, which is the
+one order the arm physically cannot execute.
+
+`core/order.py`'s `layer_boundaries()` fixes it by grouping heights into real
+layers: a layer is a run of stick tops all within `layer_tolerance_m` of that
+run's own lowest member. **Complete linkage, deliberately** — a layer's span
+can then never exceed the tolerance, so a design with a long shallow ramp of
+heights cannot chain itself into one enormous layer the way nearest-neighbour
+linkage would. It is anchored on the data rather than on a fixed grid, so a
+real course only splits when it genuinely spans more than the tolerance —
+unlike `round(z / tolerance)`, which splits whichever courses happen to
+straddle a bucket edge. Exposed as **Layer Height Tolerance** (Design ▸
+Advanced), default 10 mm: comfortably above the expansion spread, comfortably
+below one stick's length, since the shortest stock either robot accepts is
+30 mm.
+
+**No new cost term was needed.** C2 was already right; it just never got to
+run. Within a layer the solver orders by *descending* distance from the
+robot's own shoulder axis, so it never puts a stick between the robot and
+somewhere it still has to reach at that height: the far side goes up first,
+then the core, and the near side — the only part the arm must lean over to
+reach anything else — goes up last.
+
+⚠ **That is deliberately not the same as "centre outward"**, which is what
+was asked for. Centre-out fixes the reported symptom (the core would indeed
+precede the near ring) but breaks the far side: having built the core, the
+arm would then have to reach *over* it to place the far ring at the same
+height. Far → core → near gives the requested behaviour where it matters and
+avoids that. Distance is measured radially from the shoulder axis rather than
+in X, or from the design's own centre, because that is the direction the arm
+actually extends along; two sticks at the same radius sit at different
+azimuths and so do not block one another.
+
+Measured on the reporter's own 280-stick lattice (`RoboArm.blend`, KR10,
+7 courses of 40 sticks): before, each course's core was placed *last* within
+its course; after, the core lands mid-course and the entire near-side ring is
+last in 6 of the 7 courses. In course 0 the ceiling ring interleaves, because
+C1 will not let a ceiling stick go up before the uprights carrying it — that
+is the support constraint doing its job, not a regression. Solve time went
+from 5.0 s to 3.9 s.
 
 ### 6.2 Structural cases to detect and warn about
 
@@ -1248,6 +1308,54 @@ orders provably differ), the empty-for-the-first-stick edge case, and
 that it goes empty with zero or multiple edges selected; 455/455 in both
 bare CPython and real Blender. The actual on-screen appearance still
 could not be checked visually here.
+
+### 10.11 ✅ Operators leave Edit Mode by themselves (added 2026-09-09)
+
+Reported: *"When trying to change the order of one edge, I get the error
+'Cannot add vertices in edit mode'. When going back to object mode, this
+error disappears, but it is a hassle having to change modes. I would like
+the script to automatically change modes when needed."*
+
+Check By Eye (§10.9) deliberately leaves the **build mesh** in Edit Mode so
+the selected edge stays highlighted. Move Earlier/Later is the button reached
+for next — and it regenerates the build mesh, so it landed on
+`mesh.from_pydata()` → `Mesh.vertices.add()`, which Blender refuses while the
+mesh is in Edit Mode. Reproduced against the reporter's own file and
+confirmed to hit **four** operators, not one: Move Build Step, Compute Build
+Order, Extract Sticks and Export Build File all re-extract or regenerate the
+build mesh.
+
+There is a second, quieter half to the same problem. An attribute layer's
+`.data` reads back **empty** in Edit Mode rather than raising, so
+`assign_stable_ids()` would have seen a zero-length id layer and minted fresh
+ids for every edge — silently renumbering the whole design. Extraction used
+to sidestep both by *refusing* (`check_design_ready`'s "Leave Edit Mode on
+'X' before extracting").
+
+`ops/design.py`'s `object_mode_for_mesh_writes()` context manager now wraps
+every data-touching operator: drop to Object Mode, do the work, put the user
+back exactly where they were. Leaving Edit Mode is also what makes the read
+**correct** rather than merely legal — Blender flushes the BMesh back into
+the Mesh on the way out, so a design the user was mid-edit on is extracted at
+the coordinates now on screen instead of the stale pre-edit ones (there is a
+test for exactly that). `check_design_ready`'s refusal stays as a guard for
+direct API callers, but no button-driven path can reach it any more.
+`Drop to Build Plate`, whose `poll()` used to grey the button out in Edit
+Mode, now switches like the rest.
+
+Coming back out, the build mesh's edge selection is re-applied by hand:
+`rebuild_build_mesh` replaces the mesh data outright, so the Check By Eye
+highlight would otherwise return empty. The camera is deliberately **not**
+re-framed — whatever angle the user was inspecting from survives a reorder,
+so "check by eye → move earlier → check by eye" is now a continuous loop
+rather than a mode dance. `select_only_edge()` does the selection through
+`bmesh` rather than `bpy.ops.mesh.select_all`, because the restore path runs
+in a `finally` with no guaranteed operator context to lend a `mesh.*`
+operator's poll.
+
+⚠ Blender's multi-object Edit Mode is restored only for the **active**
+object: leaving drops every object that was in Edit Mode, and coming back
+brings back the active one. Same as pressing Tab twice by hand.
 
 ---
 

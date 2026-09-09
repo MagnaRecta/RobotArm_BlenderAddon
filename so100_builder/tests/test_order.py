@@ -184,6 +184,106 @@ class TestJawGeometry(unittest.TestCase):
 # --- support graph ------------------------------------------------------------
 
 
+class TestLayerBoundaries(unittest.TestCase):
+    """Sec 6 C2's "within a layer", added 2026-09-09 -- see
+    ``layer_boundaries``'s own docstring for why raw Z was not one."""
+
+    def layers(self, heights, tolerance_m=O.DEFAULT_LAYER_TOLERANCE_M):
+        import bisect
+        bounds = O.layer_boundaries(heights, tolerance_m)
+        return [bisect.bisect_right(bounds, h) for h in heights]
+
+    def test_no_heights_has_no_boundaries(self):
+        self.assertEqual(O.layer_boundaries([]), [])
+
+    def test_one_height_is_a_single_layer(self):
+        self.assertEqual(O.layer_boundaries([0.05]), [])
+
+    def test_expansion_noise_stays_one_layer(self):
+        # The real failure: a physically flat course arrives as a spread of
+        # distinct floats because mesh expansion nudged every vertex.
+        course = [0.0662, 0.0664, 0.0665, 0.0667, 0.0671, 0.0673]
+        self.assertEqual(self.layers(course), [0] * len(course))
+
+    def test_separate_courses_land_in_separate_layers(self):
+        heights = [0.0318, 0.0320, 0.0662, 0.0673, 0.1015, 0.1027]
+        self.assertEqual(self.layers(heights), [0, 0, 1, 1, 2, 2])
+
+    def test_layers_are_numbered_upward(self):
+        self.assertEqual(self.layers([0.20, 0.10, 0.30]), [1, 0, 2])
+
+    def test_a_layer_never_spans_more_than_the_tolerance(self):
+        # Complete linkage, not nearest-neighbour: a shallow ramp of closely
+        # spaced heights must NOT chain into one enormous layer.
+        ramp = [i * 0.002 for i in range(50)]
+        assigned = self.layers(ramp, tolerance_m=0.010)
+        self.assertGreater(max(assigned), 1)
+        for layer in set(assigned):
+            members = [h for h, a in zip(ramp, assigned) if a == layer]
+            self.assertLessEqual(max(members) - min(members), 0.010 + 1e-12)
+
+    def test_a_bigger_tolerance_merges_courses(self):
+        heights = [0.0318, 0.0662, 0.1015]
+        self.assertEqual(self.layers(heights, tolerance_m=0.001), [0, 1, 2])
+        self.assertEqual(self.layers(heights, tolerance_m=0.100), [0, 0, 0])
+
+
+class TestAccessibilityWithinALayer(unittest.TestCase):
+    """Sec 6 C2: a layer is built from the far side back toward the robot, so
+    the arm never walls off somewhere it still has to reach at that height.
+
+    Before layers existed this was untestable *and* untested: every stick's
+    raw Z differed, so the height key never tied and this term never ran
+    (2026-09-09 user report -- a voxel lattice built each course's outer ring
+    before its core, which is the one order the arm cannot do)."""
+
+    def _row_of_uprights(self, radii, z0=0.0):
+        """Free-standing uprights at a range of distances from the robot,
+        all topping out in the same layer."""
+        points, edges = [], []
+        for index, radius in enumerate(radii):
+            points.extend([(0.0, -radius, z0), (0.0, -radius, z0 + L)])
+            edges.append((2 * index, 2 * index + 1))
+        return extract(points, edges)
+
+    # so_arm_100 reaches a free-standing upright between roughly 0.32 m and
+    # 0.46 m out, so every radius here stays inside that band -- a stick the
+    # arm cannot reach at all is force-placed last, which would make these
+    # pass for entirely the wrong reason.
+    def test_the_far_side_of_a_layer_is_built_first(self):
+        radii = [0.34, 0.38, 0.42, 0.46]
+        result = self._row_of_uprights(radii)
+        order = O.OrderSolver(result.sticks).solve()
+        self.assertTrue(order.complete)
+        self.assertEqual(order.forced, 0)
+
+        placed = [
+            math.hypot(entry.stick.base[0], entry.stick.base[1])
+            for entry in order.ordered
+        ]
+        self.assertEqual(placed, sorted(placed, reverse=True))
+
+    def test_the_layer_below_is_finished_before_the_one_above(self):
+        # Height still wins over accessibility: the near stick of a layer
+        # goes up before ANY stick of the layer above, never the other way
+        # round -- otherwise "far side first" would climb the far column all
+        # the way to the top and leave the near one to reach past.
+        points = [
+            (0.0, -0.34, 0.0), (0.0, -0.34, L),   # 0-1  near, layer 0
+            (0.0, -0.42, 0.0), (0.0, -0.42, L),   # 2-3  far,  layer 0
+            (0.0, -0.42, 2 * L),                  # 4    stacked on the far
+        ]
+        result = extract(points, [(0, 1), (2, 3), (3, 4)])
+        solver = O.OrderSolver(result.sticks)
+        order = solver.solve()
+        self.assertTrue(order.complete)
+        self.assertEqual(order.forced, 0)
+
+        layers = [solver.layer_of(entry.stick) for entry in order.ordered]
+        self.assertEqual(layers, sorted(layers))
+        self.assertEqual(layers[-1], max(layers))
+
+
 class TestSupportGraph(unittest.TestCase):
     def test_grounded_vertices_are_found_from_physical_ends(self):
         result = extract([(0.0, Y, 0.0), (0.0, Y, L)], [(0, 1)])

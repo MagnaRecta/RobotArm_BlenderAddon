@@ -50,6 +50,7 @@ phase where that actually matters -- extraction is sub-10 ms, but ordering
 is a search with an IK call inside its inner loop.
 """
 
+import bisect
 import copy
 import math
 
@@ -114,6 +115,13 @@ CANTILEVER_ANGLE_RAD = math.radians(30.0)
 
 # Sec 6.1: "cap the backtrack depth and report honestly if the cap is hit".
 DEFAULT_BACKTRACK_LIMIT = 500
+
+# How close two stick tops must be to count as the same physical course of
+# the build (Sec 6 C2's "within a layer"). 10 mm is comfortably above the
+# sub-millimetre spread the mesh-expansion solve leaves behind, and
+# comfortably below one stick's length -- the shortest stock either robot
+# accepts is 30 mm, so a real layer can never be thinner than this.
+DEFAULT_LAYER_TOLERANCE_M = 0.010
 
 # Candidate evaluations per step() call. Tuned so a tick stays well inside
 # a frame at 60 Hz even when every evaluation misses the reachability cache.
@@ -244,6 +252,48 @@ def jaw_clearance(stick, placed_sticks,
                 offender = other.id
 
     return worst >= required, worst, offender
+
+
+def layer_boundaries(heights, tolerance_m=DEFAULT_LAYER_TOLERANCE_M):
+    """Split stick heights into physical build layers -- Sec 6 C2's "within a
+    layer", which until 2026-09-09 had no implementation behind it.
+
+    Returns the Z values *between* consecutive layers, so
+    ``bisect.bisect_right(boundaries, z)`` gives a height's layer index.
+
+    A layer is a run of heights all within ``tolerance_m`` of that run's own
+    lowest member. Complete linkage, deliberately: a layer's total span can
+    then never exceed the tolerance, so a design with a long shallow ramp of
+    heights cannot chain itself into one enormous layer the way
+    nearest-neighbour linkage would. It is anchored on the data rather than
+    on a fixed grid, so a real course only ever splits when it genuinely
+    spans more than the tolerance -- unlike ``round(z / tolerance)``, which
+    splits whichever courses happen to straddle a bucket edge.
+
+    ⚠ **Why this is needed at all.** ``_cost`` sorts on height first and
+    accessibility second. Height came straight off the stick as a raw float,
+    and the mesh-expansion solve (Sec 5.2) nudges every vertex by a fraction
+    of a millimetre -- so a physically flat course of sticks reaches the
+    solver as dozens of distinct Z values that never compare equal. The
+    primary key therefore never tied, the accessibility tie-breaker never
+    ran, and the within-layer order was decided entirely by sub-millimetre
+    expansion noise. On the 2026-09-09 voxel-lattice test design that put the
+    whole outer ring of each course ahead of that course's core -- the one
+    order the arm physically cannot execute, since the ring walls in the core
+    it still has to reach into. Quantizing here is what lets C2 actually take
+    effect; ``_cost`` itself did not need a new term.
+    """
+    ordered = sorted(heights)
+    if not ordered:
+        return []
+    boundaries = []
+    start = previous = ordered[0]
+    for height in ordered[1:]:
+        if height - start > tolerance_m:
+            boundaries.append(0.5 * (previous + height))
+            start = height
+        previous = height
+    return boundaries
 
 
 def _horizontal_reach(point, shoulder_axis_point=_SO_ARM_100_SHOULDER_AXIS_POINT):
@@ -423,6 +473,7 @@ class OrderSolver:
                  ground_height_m=0.0,
                  ground_required=True,
                  backtrack_limit=DEFAULT_BACKTRACK_LIMIT,
+                 layer_tolerance_m=DEFAULT_LAYER_TOLERANCE_M,
                  robot_id=core_robots.SO_ARM_100_ID,
                  grasp_offset_m=None,
                  jaw_width_m=None,
@@ -445,6 +496,12 @@ class OrderSolver:
         # start each disconnected component.
         self._ground_required = ground_required
         self._backtrack_limit = backtrack_limit
+        # Sec 6 C2 is "build bottom-up, and far-from-robot first WITHIN A
+        # LAYER" -- so the solver needs to know what a layer is. See
+        # layer_boundaries() for why a raw Z comparison silently wasn't one.
+        self._layer_tolerance_m = layer_tolerance_m
+        self._layer_boundaries = layer_boundaries(
+            [max(s.base[2], s.tip[2]) for s in sticks], layer_tolerance_m)
         # Multi-robot support: everything reachability-related below goes
         # through the SELECTED robot's own kinematics, not so_arm_100's
         # unconditionally (module docstring). `None` for grasp_offset_m/
@@ -596,14 +653,36 @@ class OrderSolver:
         options.sort(key=lambda s: s.base[2])
         return options
 
+    def layer_of(self, stick):
+        """Which physical course of the build this stick tops out in.
+
+        Keyed on the stick's TOP, matching "build bottom-up": a stick is
+        finished, and starts being an obstacle, at its upper end.
+        """
+        return bisect.bisect_right(
+            self._layer_boundaries, max(stick.base[2], stick.tip[2]))
+
     def _cost(self, stick):
-        """Sec 6.1's cost, ascending: build upward, far side first, prefer
-        better-anchored."""
-        max_z = max(stick.base[2], stick.tip[2])
+        """Sec 6.1's cost, ascending: build upward a layer at a time, far
+        side of each layer first, prefer better-anchored.
+
+        The middle term is what keeps the arm out of its own way. It orders
+        a layer by descending distance from the robot's own shoulder axis,
+        so the solver never puts a stick between the robot and somewhere it
+        still has to reach at that height: the far side goes up first, then
+        the core, and the near side -- the only part the arm has to lean
+        over to reach anything else -- goes up last. Distance is measured
+        radially from the shoulder AXIS rather than in X or from the design's
+        own centre, because that is the direction the arm actually extends
+        along; two sticks at the same radius sit at different azimuths and so
+        do not block one another.
+        """
         midpoint = v_scale(v_add(stick.base, stick.tip), 0.5)
         supports = int(stick.v_base in self._available) + int(
             stick.v_tip in self._available)
-        return (max_z, -_horizontal_reach(midpoint, self._shoulder_axis_point), -supports)
+        return (self.layer_of(stick),
+                -_horizontal_reach(midpoint, self._shoulder_axis_point),
+                -supports)
 
     def _placement_warnings(self, oriented):
         warnings = []

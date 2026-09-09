@@ -117,6 +117,19 @@ Phase 6 (rotating table) have not been started. See
 
 Format: `[owning side]` short description — pointer.
 
+- `[shared]` **`kr10_r900_2_kinematics` has DRIFTED again (noticed
+  2026-09-09), fourth time.** `test_vendor_sync.py` is failing on three
+  modules: `constants.py` (~71 changed lines, upstream 2026-09-08),
+  `grasp.py` (~65 added lines, upstream 2026-09-07) and `__init__.py` (2 new
+  exports). `chain.py` and `jaw_clearance.py` are still byte-identical.
+  Noticed while running the suite for an unrelated change — **not** caused by
+  it, and deliberately left alone: re-vendoring is a decision about which
+  upstream state to freeze, and the diff includes new public functions, not
+  just comments. Re-vendor from
+  `~/ros2_ws/src/kuka_control/kr10_r900_2_kinematics/kr10_r900_2_kinematics/`
+  when the upstream side is ready, reading the diff first as with the three
+  previous cycles below.
+
 - `[shared]` **Multi-robot support kicked off 2026-08-21.** The addon and the
   build-file protocol are being generalized to target more than one arm: the
   SO-100 (this repo, testing/dev rig) and a **KUKA KR10 R900-2** (`kuka_control`
@@ -211,6 +224,53 @@ Format: `[owning side]` short description — pointer.
   tradeoff); see `ROS2_IMPLEMENTATION_PLAN.md` §11 Phase 5's note.
 
 ## Resolved
+
+- `[Blender]` **Build order now has real layers, so "far side first" finally
+  runs, 2026-09-09** — user report: "when trying to generate a build order, I
+  feel like the algorithm prioritizes the outer layer. This is a problem since
+  the robot will not be able to reach the inner sticks if the outer layer is
+  already built." Correct, and the cause was not the accessibility heuristic
+  but the key above it. `_cost`'s primary key was the stick's raw `max_z`, and
+  mesh expansion (§5.2) nudges every vertex by a fraction of a millimetre — so
+  a physically flat course arrived as dozens of distinct floats that never
+  compared equal (measured on the reporter's file: one course spread over ten
+  heights spanning 1.1 mm, against a 34 mm gap between courses). The primary
+  key never tied, so §6 C2's "far-from-robot first **within a layer**"
+  tie-breaker never executed and within-course order was decided by expansion
+  noise. New `core/order.py` `layer_boundaries()` groups tops into real layers
+  (complete linkage, so a shallow ramp cannot chain into one giant layer);
+  `Layer Height Tolerance` in Design ▸ Advanced, default 10 mm. **No new cost
+  term** — C2 was already right, it just never got to run. Note the result is
+  far → core → near, deliberately *not* the "centre outward" that was asked
+  for: centre-out fixes the reported symptom but then forces the arm to reach
+  over the finished core to place the far ring at the same height. Measured on
+  the reporter's 280-stick lattice: the core of each course used to be placed
+  last within its course, now lands mid-course with the whole near-side ring
+  last in 6 of 7 courses (course 0 interleaves because C1 will not let a
+  ceiling stick precede its uprights — support doing its job). Solve 5.0 s →
+  3.9 s. 469/469 tests bar the vendor-drift failures below. **Not yet run on
+  hardware** — the claim that this is the order the arm can actually execute
+  is geometric reasoning plus the reporter's own observation, not a robot run.
+
+- `[Blender]` **Operators leave Edit Mode by themselves, 2026-09-09** — user
+  report: "when trying to change the order of one edge, I get the error
+  'Cannot add vertices in edit mode'... it is a hassle having to change
+  modes." Check By Eye deliberately leaves the build mesh in Edit Mode, and
+  Move Earlier/Later regenerates that mesh — `mesh.from_pydata()` refuses
+  while it is in Edit Mode. Reproduced against the reporter's own file and
+  found to affect **four** operators (Move Build Step, Compute Build Order,
+  Extract Sticks, Export Build File), plus a quieter second failure: an
+  attribute layer's `.data` reads back *empty* rather than raising in Edit
+  Mode, so `assign_stable_ids()` would have silently renumbered every edge.
+  New `object_mode_for_mesh_writes()` context manager drops to Object Mode,
+  does the work and restores the exact previous mode, re-applying the Check By
+  Eye edge highlight (the mesh is replaced, so the selection cannot survive on
+  its own) without re-framing the camera. Leaving Edit Mode is also what makes
+  the read *correct*: Blender flushes the BMesh into the Mesh on the way out,
+  so a mid-edit design extracts at its on-screen coordinates rather than the
+  stale pre-edit ones. `check_design_ready`'s old refusal stays as a guard for
+  direct API callers only. ⚠ Multi-object Edit Mode is restored for the active
+  object only — same as pressing Tab twice.
 
 - `[Blender]` **"Highlight Previous Sticks" checkbox, 2026-08-24** — user
   request: "a checkbox before the check by eye button that makes all the
